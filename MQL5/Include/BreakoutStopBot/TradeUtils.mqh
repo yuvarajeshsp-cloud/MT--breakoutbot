@@ -31,38 +31,24 @@ double NormalizeVolume(const string symbol,double volume)
    return NormalizeDouble(normalized,2);
   }
 
-// Clamps a pending order price to respect the broker's minimum stop distance,
-// so a breakout (or fade, in reverse mode) level sitting too close to the
-// current price doesn't get rejected. Handles both stop and limit orders since
-// InpReverseSignal switches between them.
+// Clamps a pending stop price to respect the broker's minimum stop distance,
+// so a breakout level sitting too close to the current price doesn't get rejected.
 double AdjustStopPrice(const string symbol,ENUM_ORDER_TYPE orderType,double price)
   {
    long stopsLevelPoints=SymbolInfoInteger(symbol,SYMBOL_TRADE_STOPS_LEVEL);
    double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
    double minDistance=stopsLevelPoints*point;
    int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
-   double ask=SymbolInfoDouble(symbol,SYMBOL_ASK);
-   double bid=SymbolInfoDouble(symbol,SYMBOL_BID);
 
    if(orderType==ORDER_TYPE_BUY_STOP)
      {
-      double minPrice=ask+minDistance;
+      double minPrice=SymbolInfoDouble(symbol,SYMBOL_ASK)+minDistance;
       if(price<minPrice) price=minPrice;
      }
    else if(orderType==ORDER_TYPE_SELL_STOP)
      {
-      double maxPrice=bid-minDistance;
+      double maxPrice=SymbolInfoDouble(symbol,SYMBOL_BID)-minDistance;
       if(price>maxPrice) price=maxPrice;
-     }
-   else if(orderType==ORDER_TYPE_BUY_LIMIT)
-     {
-      double maxPrice=ask-minDistance;
-      if(price>maxPrice) price=maxPrice;
-     }
-   else if(orderType==ORDER_TYPE_SELL_LIMIT)
-     {
-      double minPrice=bid+minDistance;
-      if(price<minPrice) price=minPrice;
      }
    return NormalizeDouble(price,digits);
   }

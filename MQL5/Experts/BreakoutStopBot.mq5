@@ -1,9 +1,9 @@
 #property copyright "BreakoutStopBot"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
-#property description "Candle breakout bot: places an OCO pair at the prior candle's high/low "
-#property description "every bar (Buy Stop/Sell Stop, or Sell Limit/Buy Limit to fade in reverse "
-#property description "mode), manages TP/SL, breakeven, early drawdown exit."
+#property description "Candle breakout bot: places a Buy Stop / Sell Stop OCO pair at the prior "
+#property description "candle's high/low every bar, manages TP/SL/breakeven, closes drawdown "
+#property description "positions at candle close, and flattens everything once a day."
 
 #include <Trade/Trade.mqh>
 #include "../Include/BreakoutStopBot/TradeUtils.mqh"
@@ -32,8 +32,7 @@ input double InpBreakevenBufferPips    = 0.25;   // Extra pips locked in beyond 
 
 input group "=== Entry ==="
 input double InpEntryBufferPips        = 0.0;    // Offset beyond prior candle's high/low
-input int    InpPendingExpiryMinutes   = 0;       // 0 = GTC (orders are replaced every bar regardless)
-input bool   InpReverseSignal          = false;  // Fade the breakout instead of following it: Sell Limit at prior high, Buy Limit at prior low
+input int    InpPendingExpiryMinutes   = 0;      // 0 = GTC (orders are replaced every bar regardless)
 
 input group "=== Position Sizing ==="
 input bool   InpUseRiskPercent         = false;  // Use risk-percent sizing instead of fixed lot
@@ -63,74 +62,16 @@ input group "=== Dashboard ==="
 input bool   InpShowDashboard          = true;   // Show on-chart P/L dashboard
 input int    InpDashboardRefreshSeconds= 5;      // How often the dashboard recalculates
 
-input group "=== Chart Display ==="
-input bool   InpHideTradeLevels        = true;   // Hide the SL/TP/entry lines MT5 draws on the chart
-
-input group "=== Virtual Exit Management ==="
-input bool   InpUseVirtualExits        = true;   // Manage TP/SL/breakeven in the EA instead of on the broker order
-input double InpBackstopSLMultiplier   = 4.0;    // Real broker-side SL = InpStopLossPips x this, as a disconnect/crash backstop only (virtual exits mode)
-
-input group "=== Trailing Stop ==="
-input bool   InpUseTrailingStop        = true;   // Trail the SL for any position in profit at candle close, taking over from the fixed TP
-input double InpTrailingDistancePips   = 20.0;   // Distance kept between price and the trailing SL
-
 input group "=== Daily Flatten ==="
 input bool   InpUseDailyFlatten        = true;   // Close all positions and cancel all pending orders once per day
 input int    InpDailyFlattenHour       = 0;      // Server-time hour to flatten (0 = midnight)
 
 CTrade           trade;
-ENUM_TIMEFRAMES  g_timeframe             = PERIOD_M1;
-datetime         g_lastBarTime           = 0;
-ulong            g_pendingUpperTicket    = 0;
-ulong            g_pendingLowerTicket    = 0;
-bool             g_originalShowTradeLevels = true;
-int              g_lastFlattenDay        = -1;
-
-// Per-position exit state. sl is the current committed protective stop (only ever
-// ratchets to a more favorable price - by breakeven, then by trailing once active).
-// trailingActive, once set, means the fixed virtual TP no longer applies to this
-// position; only the trailing sl does.
-struct PositionState
-  {
-   ulong  ticket;
-   double sl;
-   bool   trailingActive;
-  };
-PositionState g_positionStates[];
-
-int FindPositionState(ulong ticket)
-  {
-   for(int i=0;i<ArraySize(g_positionStates);i++)
-      if(g_positionStates[i].ticket==ticket)
-         return i;
-   return -1;
-  }
-
-int EnsurePositionState(ulong ticket,double initialSl)
-  {
-   int idx=FindPositionState(ticket);
-   if(idx>=0) return idx;
-   int n=ArraySize(g_positionStates);
-   ArrayResize(g_positionStates,n+1);
-   g_positionStates[n].ticket=ticket;
-   g_positionStates[n].sl=initialSl;
-   g_positionStates[n].trailingActive=false;
-   return n;
-  }
-
-void PrunePositionStates(const string symbol,ulong magic)
-  {
-   ulong openTickets[];
-   int openCount=GetPositionTickets(symbol,magic,openTickets);
-   for(int i=ArraySize(g_positionStates)-1;i>=0;i--)
-     {
-      bool stillOpen=false;
-      for(int j=0;j<openCount;j++)
-         if(openTickets[j]==g_positionStates[i].ticket) { stillOpen=true; break; }
-      if(!stillOpen)
-         ArrayRemove(g_positionStates,i,1);
-     }
-  }
+ENUM_TIMEFRAMES  g_timeframe            = PERIOD_M1;
+datetime         g_lastBarTime          = 0;
+ulong            g_pendingBuyStopTicket = 0;
+ulong            g_pendingSellStopTicket= 0;
+int              g_lastFlattenDay       = -1;
 
 int OnInit()
   {
@@ -158,20 +99,10 @@ int OnInit()
 
    Print("BreakoutStopBot init: timeframe=",TimeframeLabel(g_timeframe),
          " TP=",DoubleToString(InpTakeProfitPips,1),"pips SL=",DoubleToString(InpStopLossPips,1),"pips",
-         " virtualExits=",InpUseVirtualExits,
-         " backstopSL=",DoubleToString(InpStopLossPips*InpBackstopSLMultiplier,1),"pips",
-         " hideTradeLevels=",InpHideTradeLevels,
+         " breakevenTrigger=",DoubleToString(InpBreakevenTriggerPips,1),"pips",
          " volumeFilter=",InpUseVolumeFilter,"(",InpVolumeLookbackBars,"bars,>=",DoubleToString(InpMinVolumeRatio,2),"x)",
-         " reverseSignal=",InpReverseSignal,
-         " trailingStop=",InpUseTrailingStop,"(",DoubleToString(InpTrailingDistancePips,1),"pips)",
+         " sessionFilter=",InpUseSessionFilter,
          " dailyFlatten=",InpUseDailyFlatten,"(hour ",InpDailyFlattenHour,")");
-
-   g_originalShowTradeLevels=(bool)ChartGetInteger(0,CHART_SHOW_TRADE_LEVELS);
-   if(InpHideTradeLevels)
-     {
-      ChartSetInteger(0,CHART_SHOW_TRADE_LEVELS,false);
-      ChartRedraw(0);
-     }
 
    if(InpShowDashboard)
      {
@@ -188,15 +119,12 @@ void OnDeinit(const int reason)
    EventKillTimer();
    RemoveDashboard();
 
-   if(InpHideTradeLevels)
-      ChartSetInteger(0,CHART_SHOW_TRADE_LEVELS,g_originalShowTradeLevels);
-
    if(InpCancelPendingOnRemove && reason==REASON_REMOVE)
      {
-      if(g_pendingUpperTicket!=0 && OrderSelect(g_pendingUpperTicket))
-         trade.OrderDelete(g_pendingUpperTicket);
-      if(g_pendingLowerTicket!=0 && OrderSelect(g_pendingLowerTicket))
-         trade.OrderDelete(g_pendingLowerTicket);
+      if(g_pendingBuyStopTicket!=0 && OrderSelect(g_pendingBuyStopTicket))
+         trade.OrderDelete(g_pendingBuyStopTicket);
+      if(g_pendingSellStopTicket!=0 && OrderSelect(g_pendingSellStopTicket))
+         trade.OrderDelete(g_pendingSellStopTicket);
      }
   }
 
@@ -211,11 +139,7 @@ void OnTick()
    CheckDailyFlatten();
 
    EnforceOco();
-
-   if(InpUseVirtualExits)
-      ManageVirtualExits();
-   else
-      ManageBreakeven();
+   ManageBreakeven();
 
    if(IsNewBar(_Symbol,g_timeframe,g_lastBarTime))
       OnNewBar();
@@ -224,7 +148,6 @@ void OnTick()
 void OnNewBar()
   {
    CloseDrawdownPositions();
-   ManageTrailing();
    CancelStalePendingOrders();
 
    if(InpShowDashboard)
@@ -262,17 +185,17 @@ void OnNewBar()
 // don't accumulate. Positions already open are left untouched.
 void CancelStalePendingOrders()
   {
-   if(g_pendingUpperTicket!=0)
+   if(g_pendingBuyStopTicket!=0)
      {
-      if(OrderSelect(g_pendingUpperTicket))
-         trade.OrderDelete(g_pendingUpperTicket);
-      g_pendingUpperTicket=0;
+      if(OrderSelect(g_pendingBuyStopTicket))
+         trade.OrderDelete(g_pendingBuyStopTicket);
+      g_pendingBuyStopTicket=0;
      }
-   if(g_pendingLowerTicket!=0)
+   if(g_pendingSellStopTicket!=0)
      {
-      if(OrderSelect(g_pendingLowerTicket))
-         trade.OrderDelete(g_pendingLowerTicket);
-      g_pendingLowerTicket=0;
+      if(OrderSelect(g_pendingSellStopTicket))
+         trade.OrderDelete(g_pendingSellStopTicket);
+      g_pendingSellStopTicket=0;
      }
   }
 
@@ -280,33 +203,29 @@ void CancelStalePendingOrders()
 // pending, cancel the sibling so only one direction can be active at a time.
 void EnforceOco()
   {
-   if(g_pendingUpperTicket==0 && g_pendingLowerTicket==0)
+   if(g_pendingBuyStopTicket==0 && g_pendingSellStopTicket==0)
       return;
 
-   bool upperExists=g_pendingUpperTicket!=0 && OrderSelect(g_pendingUpperTicket);
-   bool lowerExists=g_pendingLowerTicket!=0 && OrderSelect(g_pendingLowerTicket);
+   bool buyExists =g_pendingBuyStopTicket!=0  && OrderSelect(g_pendingBuyStopTicket);
+   bool sellExists=g_pendingSellStopTicket!=0 && OrderSelect(g_pendingSellStopTicket);
 
-   if(g_pendingUpperTicket!=0 && !upperExists)
-      g_pendingUpperTicket=0;
-   if(g_pendingLowerTicket!=0 && !lowerExists)
-      g_pendingLowerTicket=0;
+   if(g_pendingBuyStopTicket!=0 && !buyExists)
+      g_pendingBuyStopTicket=0;
+   if(g_pendingSellStopTicket!=0 && !sellExists)
+      g_pendingSellStopTicket=0;
 
-   if(g_pendingUpperTicket==0 && g_pendingLowerTicket!=0 && lowerExists)
+   if(g_pendingBuyStopTicket==0 && g_pendingSellStopTicket!=0 && sellExists)
      {
-      trade.OrderDelete(g_pendingLowerTicket);
-      g_pendingLowerTicket=0;
+      trade.OrderDelete(g_pendingSellStopTicket);
+      g_pendingSellStopTicket=0;
      }
-   else if(g_pendingLowerTicket==0 && g_pendingUpperTicket!=0 && upperExists)
+   else if(g_pendingSellStopTicket==0 && g_pendingBuyStopTicket!=0 && buyExists)
      {
-      trade.OrderDelete(g_pendingUpperTicket);
-      g_pendingUpperTicket=0;
+      trade.OrderDelete(g_pendingBuyStopTicket);
+      g_pendingBuyStopTicket=0;
      }
   }
 
-// Normal mode: Buy Stop at the prior high (follow an upward breakout), Sell Stop at
-// the prior low (follow a downward breakout). InpReverseSignal fades instead of
-// following - Sell Limit at the prior high, Buy Limit at the prior low - since a
-// stop order can't sit on the wrong side of price; only a limit order can fade a level.
 void PlaceBreakoutStops()
   {
    double prevHigh=iHigh(_Symbol,g_timeframe,1);
@@ -317,39 +236,18 @@ void PlaceBreakoutStops()
       return;
      }
 
-   ENUM_ORDER_TYPE upperType=InpReverseSignal?ORDER_TYPE_SELL_LIMIT:ORDER_TYPE_BUY_STOP;
-   ENUM_ORDER_TYPE lowerType=InpReverseSignal?ORDER_TYPE_BUY_LIMIT :ORDER_TYPE_SELL_STOP;
-   bool upperIsBuy=!InpReverseSignal;
-   bool lowerIsBuy= InpReverseSignal;
-
-   double upperPrice=AdjustStopPrice(_Symbol,upperType,prevHigh+PipsToPrice(_Symbol,InpEntryBufferPips));
-   double lowerPrice=AdjustStopPrice(_Symbol,lowerType,prevLow -PipsToPrice(_Symbol,InpEntryBufferPips));
+   double buyStopPrice =AdjustStopPrice(_Symbol,ORDER_TYPE_BUY_STOP, prevHigh+PipsToPrice(_Symbol,InpEntryBufferPips));
+   double sellStopPrice=AdjustStopPrice(_Symbol,ORDER_TYPE_SELL_STOP,prevLow -PipsToPrice(_Symbol,InpEntryBufferPips));
 
    double lot=InpUseRiskPercent
               ? CalcLotByRisk(_Symbol,InpRiskPercent,InpStopLossPips)
               : NormalizeVolume(_Symbol,InpLotSize);
 
    int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-   double upperSl,upperTp,lowerSl,lowerTp;
-
-   if(InpUseVirtualExits)
-     {
-      // No real TP (a missed TP just leaves a winner open, not an account risk), and a
-      // wide real SL kept only as a crash/disconnect backstop - the tight virtual SL
-      // below is what actually protects the trade under normal operation.
-      double backstopPips=InpStopLossPips*InpBackstopSLMultiplier;
-      upperSl=NormalizeDouble(upperIsBuy?upperPrice-PipsToPrice(_Symbol,backstopPips):upperPrice+PipsToPrice(_Symbol,backstopPips),digits);
-      upperTp=0.0;
-      lowerSl=NormalizeDouble(lowerIsBuy?lowerPrice-PipsToPrice(_Symbol,backstopPips):lowerPrice+PipsToPrice(_Symbol,backstopPips),digits);
-      lowerTp=0.0;
-     }
-   else
-     {
-      upperSl=NormalizeDouble(upperIsBuy?upperPrice-PipsToPrice(_Symbol,InpStopLossPips)  :upperPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
-      upperTp=NormalizeDouble(upperIsBuy?upperPrice+PipsToPrice(_Symbol,InpTakeProfitPips):upperPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
-      lowerSl=NormalizeDouble(lowerIsBuy?lowerPrice-PipsToPrice(_Symbol,InpStopLossPips)  :lowerPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
-      lowerTp=NormalizeDouble(lowerIsBuy?lowerPrice+PipsToPrice(_Symbol,InpTakeProfitPips):lowerPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
-     }
+   double buySl =NormalizeDouble(buyStopPrice -PipsToPrice(_Symbol,InpStopLossPips),  digits);
+   double buyTp =NormalizeDouble(buyStopPrice +PipsToPrice(_Symbol,InpTakeProfitPips),digits);
+   double sellSl=NormalizeDouble(sellStopPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
+   double sellTp=NormalizeDouble(sellStopPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
 
    ENUM_ORDER_TYPE_TIME typeTime=ORDER_TIME_GTC;
    datetime expiration=0;
@@ -361,15 +259,15 @@ void PlaceBreakoutStops()
 
    string comment=StringFormat("BOS_%d",(int)g_lastBarTime);
 
-   if(trade.OrderOpen(_Symbol,upperType,lot,0.0,upperPrice,upperSl,upperTp,typeTime,expiration,comment))
-      g_pendingUpperTicket=trade.ResultOrder();
+   if(trade.OrderOpen(_Symbol,ORDER_TYPE_BUY_STOP,lot,0.0,buyStopPrice,buySl,buyTp,typeTime,expiration,comment))
+      g_pendingBuyStopTicket=trade.ResultOrder();
    else
-      Print(EnumToString(upperType)," failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(upperPrice,digits));
+      Print("Buy stop failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(buyStopPrice,digits));
 
-   if(trade.OrderOpen(_Symbol,lowerType,lot,0.0,lowerPrice,lowerSl,lowerTp,typeTime,expiration,comment))
-      g_pendingLowerTicket=trade.ResultOrder();
+   if(trade.OrderOpen(_Symbol,ORDER_TYPE_SELL_STOP,lot,0.0,sellStopPrice,sellSl,sellTp,typeTime,expiration,comment))
+      g_pendingSellStopTicket=trade.ResultOrder();
    else
-      Print(EnumToString(lowerType)," failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(lowerPrice,digits));
+      Print("Sell stop failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(sellStopPrice,digits));
   }
 
 void CloseDrawdownPositions()
@@ -438,200 +336,6 @@ void ManageBreakeven()
      }
   }
 
-void CloseVirtual(ulong ticket,string reason)
-  {
-   if(trade.PositionClose(ticket))
-      Print("Closed position #",ticket," via ",reason);
-   else
-      Print("Failed to close position #",ticket," (",reason,") error=",GetLastError());
-  }
-
-// EA-side TP/SL/breakeven: the broker only holds a wide backstop SL (see
-// PlaceBreakoutStops), so under normal operation this is what actually exits trades.
-// Once ManageTrailing has marked a position's state trailingActive, the fixed TP
-// check below is skipped for it - the trailing SL is its only exit from that point.
-void ManageVirtualExits()
-  {
-   ulong tickets[];
-   int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
-   if(n==0) { PrunePositionStates(_Symbol,InpMagicNumber); return; }
-
-   PrunePositionStates(_Symbol,InpMagicNumber);
-
-   double spreadPips=CurrentSpreadPips(_Symbol);
-   double bePips=spreadPips+InpBreakevenBufferPips;
-   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-
-   for(int i=0;i<n;i++)
-     {
-      if(!PositionSelectByTicket(tickets[i]))
-         continue;
-
-      long type=PositionGetInteger(POSITION_TYPE);
-      double entry=PositionGetDouble(POSITION_PRICE_OPEN);
-
-      if(type==POSITION_TYPE_BUY)
-        {
-         double originalSl=entry-PipsToPrice(_Symbol,InpStopLossPips);
-         int idx=EnsurePositionState(tickets[i],originalSl);
-
-         double profitPips=PriceToPips(_Symbol,bid-entry);
-         if(profitPips>=InpBreakevenTriggerPips)
-           {
-            double beSl=NormalizeDouble(entry+PipsToPrice(_Symbol,bePips),digits);
-            if(beSl>g_positionStates[idx].sl)
-               g_positionStates[idx].sl=beSl;
-           }
-
-         double virtualTp=entry+PipsToPrice(_Symbol,InpTakeProfitPips);
-
-         if(!g_positionStates[idx].trailingActive && bid>=virtualTp)
-            CloseVirtual(tickets[i],"virtual TP");
-         else if(bid<=g_positionStates[idx].sl)
-            CloseVirtual(tickets[i],"virtual SL");
-        }
-      else if(type==POSITION_TYPE_SELL)
-        {
-         double originalSl=entry+PipsToPrice(_Symbol,InpStopLossPips);
-         int idx=EnsurePositionState(tickets[i],originalSl);
-
-         double profitPips=PriceToPips(_Symbol,entry-ask);
-         if(profitPips>=InpBreakevenTriggerPips)
-           {
-            double beSl=NormalizeDouble(entry-PipsToPrice(_Symbol,bePips),digits);
-            if(beSl<g_positionStates[idx].sl)
-               g_positionStates[idx].sl=beSl;
-           }
-
-         double virtualTp=entry-PipsToPrice(_Symbol,InpTakeProfitPips);
-
-         if(!g_positionStates[idx].trailingActive && ask<=virtualTp)
-            CloseVirtual(tickets[i],"virtual TP");
-         else if(ask>=g_positionStates[idx].sl)
-            CloseVirtual(tickets[i],"virtual SL");
-        }
-     }
-  }
-
-// Runs once per new candle close (not on every tick): for any position that is
-// currently profitable, ratchets its protective stop to InpTrailingDistancePips
-// behind the candle-close price and marks it as trailing-active, which switches
-// off the fixed TP for that position (see ManageVirtualExits/ManageBreakeven) so
-// it can keep running instead of capping out at the original take profit.
-void ManageTrailing()
-  {
-   if(!InpUseTrailingStop) return;
-
-   ulong tickets[];
-   int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
-   if(n==0) return;
-
-   PrunePositionStates(_Symbol,InpMagicNumber);
-
-   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-
-   for(int i=0;i<n;i++)
-     {
-      if(!PositionSelectByTicket(tickets[i]))
-         continue;
-
-      double profit=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
-      if(profit<=0.0)
-         continue;
-
-      long type=PositionGetInteger(POSITION_TYPE);
-      double entry=PositionGetDouble(POSITION_PRICE_OPEN);
-
-      // In real-order mode there's no virtual state yet on first touch, so fall back
-      // to the current real SL (which breakeven may have already tightened) rather
-      // than the original entry-based SL - otherwise trailing could loosen it.
-      double fallbackSl;
-      if(InpUseVirtualExits)
-         fallbackSl=(type==POSITION_TYPE_BUY)
-                    ? entry-PipsToPrice(_Symbol,InpStopLossPips)
-                    : entry+PipsToPrice(_Symbol,InpStopLossPips);
-      else
-         fallbackSl=PositionGetDouble(POSITION_SL);
-
-      int idx=EnsurePositionState(tickets[i],fallbackSl);
-      g_positionStates[idx].trailingActive=true;
-
-      double candidateSl;
-      bool improved=false;
-      if(type==POSITION_TYPE_BUY)
-        {
-         candidateSl=NormalizeDouble(bid-PipsToPrice(_Symbol,InpTrailingDistancePips),digits);
-         if(candidateSl>g_positionStates[idx].sl)
-           {
-            g_positionStates[idx].sl=candidateSl;
-            improved=true;
-           }
-        }
-      else
-        {
-         candidateSl=NormalizeDouble(ask+PipsToPrice(_Symbol,InpTrailingDistancePips),digits);
-         if(candidateSl<g_positionStates[idx].sl)
-           {
-            g_positionStates[idx].sl=candidateSl;
-            improved=true;
-           }
-        }
-
-      if(!InpUseVirtualExits)
-        {
-         if(trade.PositionModify(tickets[i],g_positionStates[idx].sl,0.0))
-           {
-            if(improved)
-               Print("Trailing SL updated for #",tickets[i]," new SL=",DoubleToString(g_positionStates[idx].sl,digits));
-           }
-         else
-            Print("Failed to update trailing SL for #",tickets[i]," error=",GetLastError());
-        }
-      else if(improved)
-         Print("Trailing SL updated (virtual) for #",tickets[i]," new SL=",DoubleToString(g_positionStates[idx].sl,digits));
-     }
-  }
-
-// Closes every open position and cancels every pending order from this EA, once per
-// calendar day at InpDailyFlattenHour (server time) - e.g. midnight to avoid holding
-// overnight. Checked every tick so it fires promptly after the hour boundary.
-void CheckDailyFlatten()
-  {
-   if(!InpUseDailyFlatten) return;
-
-   datetime now=TimeCurrent();
-   int today=(int)(now/86400);
-   MqlDateTime dt;
-   TimeToStruct(now,dt);
-
-   if(dt.hour>=InpDailyFlattenHour && g_lastFlattenDay!=today)
-     {
-      FlattenAll();
-      g_lastFlattenDay=today;
-     }
-  }
-
-void FlattenAll()
-  {
-   CancelStalePendingOrders();
-
-   ulong tickets[];
-   int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
-   for(int i=0;i<n;i++)
-     {
-      if(trade.PositionClose(tickets[i]))
-         Print("Daily flatten: closed position #",tickets[i]);
-      else
-         Print("Daily flatten: failed to close #",tickets[i]," error=",GetLastError());
-     }
-
-   ArrayResize(g_positionStates,0);
-  }
-
 bool SpreadOk()
   {
    if(InpMaxSpreadPips<=0.0)
@@ -676,4 +380,38 @@ bool WithinSession()
    if(InpTradingStartHour<=InpTradingEndHour)
       return hour>=InpTradingStartHour && hour<InpTradingEndHour;
    return hour>=InpTradingStartHour || hour<InpTradingEndHour;
+  }
+
+// Closes every open position and cancels every pending order from this EA, once per
+// calendar day at InpDailyFlattenHour (server time) - e.g. midnight to avoid holding
+// overnight. Checked every tick so it fires promptly after the hour boundary.
+void CheckDailyFlatten()
+  {
+   if(!InpUseDailyFlatten) return;
+
+   datetime now=TimeCurrent();
+   int today=(int)(now/86400);
+   MqlDateTime dt;
+   TimeToStruct(now,dt);
+
+   if(dt.hour>=InpDailyFlattenHour && g_lastFlattenDay!=today)
+     {
+      FlattenAll();
+      g_lastFlattenDay=today;
+     }
+  }
+
+void FlattenAll()
+  {
+   CancelStalePendingOrders();
+
+   ulong tickets[];
+   int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
+   for(int i=0;i<n;i++)
+     {
+      if(trade.PositionClose(tickets[i]))
+         Print("Daily flatten: closed position #",tickets[i]);
+      else
+         Print("Daily flatten: failed to close #",tickets[i]," error=",GetLastError());
+     }
   }
