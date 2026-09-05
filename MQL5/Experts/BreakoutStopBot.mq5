@@ -97,7 +97,10 @@ int OnInit()
 
    g_originalShowTradeLevels=(bool)ChartGetInteger(0,CHART_SHOW_TRADE_LEVELS);
    if(InpHideTradeLevels)
+     {
       ChartSetInteger(0,CHART_SHOW_TRADE_LEVELS,false);
+      ChartRedraw(0);
+     }
 
    if(InpShowDashboard)
      {
