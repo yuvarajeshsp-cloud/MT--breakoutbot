@@ -56,11 +56,15 @@ input group "=== Dashboard ==="
 input bool   InpShowDashboard          = true;   // Show on-chart P/L dashboard
 input int    InpDashboardRefreshSeconds= 5;      // How often the dashboard recalculates
 
+input group "=== Chart Display ==="
+input bool   InpHideTradeLevels        = true;   // Hide the SL/TP/entry lines MT5 draws on the chart
+
 CTrade           trade;
 ENUM_TIMEFRAMES  g_timeframe             = PERIOD_M1;
 datetime         g_lastBarTime           = 0;
 ulong            g_pendingBuyStopTicket  = 0;
 ulong            g_pendingSellStopTicket = 0;
+bool             g_originalShowTradeLevels = true;
 
 int OnInit()
   {
@@ -86,6 +90,10 @@ int OnInit()
 
    g_lastBarTime=iTime(_Symbol,g_timeframe,0);
 
+   g_originalShowTradeLevels=(bool)ChartGetInteger(0,CHART_SHOW_TRADE_LEVELS);
+   if(InpHideTradeLevels)
+      ChartSetInteger(0,CHART_SHOW_TRADE_LEVELS,false);
+
    if(InpShowDashboard)
      {
       CreateDashboardBackground();
@@ -100,6 +108,9 @@ void OnDeinit(const int reason)
   {
    EventKillTimer();
    RemoveDashboard();
+
+   if(InpHideTradeLevels)
+      ChartSetInteger(0,CHART_SHOW_TRADE_LEVELS,g_originalShowTradeLevels);
 
    if(InpCancelPendingOnRemove && reason==REASON_REMOVE)
      {

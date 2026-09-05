@@ -69,6 +69,7 @@ current positions.
 | `InpCancelPendingOnRemove` | true | Cancel this EA's pending stop orders when it's removed from the chart |
 | `InpShowDashboard` | true | Show the on-chart P/L dashboard |
 | `InpDashboardRefreshSeconds` | 5 | How often the dashboard recalculates from trade history |
+| `InpHideTradeLevels` | true | Hide the SL/TP/entry lines MT5 draws on the chart (see Chart Display note below) |
 
 ## Dashboard
 
@@ -86,6 +87,15 @@ on `OnDeinit`) showing:
 It updates on a timer (`InpDashboardRefreshSeconds`) and after each new
 candle's maintenance pass, and works in the Strategy Tester's visual mode as
 well as live/demo charts.
+
+## Chart display
+
+`InpHideTradeLevels` toggles the terminal's `CHART_SHOW_TRADE_LEVELS`
+property, which is the only control MT5 exposes for these lines — it hides
+entry, SL, and TP lines together for **every** order/position on that chart,
+not just this EA's, and it's chart-wide rather than per-EA. The EA records
+whatever the setting was when it started and restores it on removal, so it
+won't permanently change your terminal's chart behavior.
 
 ## Install
 
