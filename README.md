@@ -24,11 +24,9 @@ other live stats.
 Every tick:
 1. **OCO enforcement** — if one pending stop order of the current pair filled
    or disappeared while the other is still pending, the sibling is cancelled.
-2. **Breakeven check** — for each open position, if floating profit has
-   reached `InpBreakevenTriggerPips`, the stop loss moves to
-   `entry ± (current spread + InpBreakevenBufferPips)` pips, locking in a
-   small guaranteed profit. This check recomputes from position state every
-   time (no separate "already armed" flag), so it's safe across EA restarts.
+2. **Exit management** — depends on `InpUseVirtualExits` (see below):
+   `ManageVirtualExits()` when enabled (default), `ManageBreakeven()` (moves
+   the real broker-side SL) when disabled.
 
 On every new candle (once, at the bar's first tick):
 1. **Drawdown close** — any open position (from this EA) currently in
@@ -70,6 +68,8 @@ current positions.
 | `InpShowDashboard` | true | Show the on-chart P/L dashboard |
 | `InpDashboardRefreshSeconds` | 5 | How often the dashboard recalculates from trade history |
 | `InpHideTradeLevels` | true | Hide the SL/TP/entry lines MT5 draws on the chart (see Chart Display note below) |
+| `InpUseVirtualExits` | true | Manage TP/SL/breakeven in the EA instead of on the broker order (see Virtual Exit Management below) |
+| `InpBackstopSLMultiplier` | 4.0 | Real broker-side SL = `InpStopLossPips` × this, kept only as a crash/disconnect backstop (virtual exits mode) |
 
 ## Dashboard
 
@@ -96,6 +96,40 @@ entry, SL, and TP lines together for **every** order/position on that chart,
 not just this EA's, and it's chart-wide rather than per-EA. The EA records
 whatever the setting was when it started and restores it on removal, so it
 won't permanently change your terminal's chart behavior.
+
+## Virtual Exit Management
+
+With `InpUseVirtualExits` enabled (default), the broker order carries **no
+real TP and only a wide backstop SL** (`InpStopLossPips × InpBackstopSLMultiplier`).
+The actual TP, SL, and breakeven logic all live in the EA (`ManageVirtualExits()`,
+called every tick) and close the position at market via `trade.PositionClose()`
+when a level is crossed — so under normal operation, the chart shows no TP
+line at all and, if `InpHideTradeLevels` is also on, no SL/entry line either.
+
+**This is a deliberate trade-off, not free correctness:**
+- A real broker-side SL/TP is enforced by the broker's server even if your
+  terminal, EA, or VPS goes offline. A virtual one only works while the EA is
+  running and receiving ticks.
+- The wide backstop SL exists specifically to bound the damage if that
+  happens — under normal operation the tight virtual SL should always trigger
+  first, so the backstop should rarely if ever be hit. But if the terminal is
+  disconnected, crashed, or AutoTrading is off when price moves against an
+  open position, the position is protected only down to the backstop
+  distance, not the intended `InpStopLossPips`.
+- There is intentionally no backstop TP — a missed virtual TP just leaves a
+  winning trade open longer, which isn't an account-risk failure mode the
+  same way an unprotected loss is.
+- Breakeven-armed state is tracked in memory per ticket (`g_breakevenArmedTickets`)
+  since, unlike SL/TP, it depends on whether profit ever reached the trigger —
+  not just current price. That state is lost if the EA restarts before a
+  position closes; if the position is still above the trigger when it
+  restarts it re-arms immediately, but a position that armed breakeven, then
+  pulled back below the trigger, then saw the EA restart, would revert to the
+  wider original virtual SL rather than staying at breakeven.
+
+Set `InpUseVirtualExits = false` to go back to real broker-side SL/TP and
+breakeven (the original behavior), if you'd rather have guaranteed
+broker-side protection than hidden lines.
 
 ## Install
 

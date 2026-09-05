@@ -59,12 +59,17 @@ input int    InpDashboardRefreshSeconds= 5;      // How often the dashboard reca
 input group "=== Chart Display ==="
 input bool   InpHideTradeLevels        = true;   // Hide the SL/TP/entry lines MT5 draws on the chart
 
+input group "=== Virtual Exit Management ==="
+input bool   InpUseVirtualExits        = true;   // Manage TP/SL/breakeven in the EA instead of on the broker order
+input double InpBackstopSLMultiplier   = 4.0;    // Real broker-side SL = InpStopLossPips x this, as a disconnect/crash backstop only (virtual exits mode)
+
 CTrade           trade;
 ENUM_TIMEFRAMES  g_timeframe             = PERIOD_M1;
 datetime         g_lastBarTime           = 0;
 ulong            g_pendingBuyStopTicket  = 0;
 ulong            g_pendingSellStopTicket = 0;
 bool             g_originalShowTradeLevels = true;
+ulong            g_breakevenArmedTickets[];
 
 int OnInit()
   {
@@ -130,7 +135,11 @@ void OnTimer()
 void OnTick()
   {
    EnforceOco();
-   ManageBreakeven();
+
+   if(InpUseVirtualExits)
+      ManageVirtualExits();
+   else
+      ManageBreakeven();
 
    if(IsNewBar(_Symbol,g_timeframe,g_lastBarTime))
       OnNewBar();
@@ -228,10 +237,26 @@ void PlaceBreakoutStops()
               : NormalizeVolume(_Symbol,InpLotSize);
 
    int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-   double buySl =NormalizeDouble(buyStopPrice -PipsToPrice(_Symbol,InpStopLossPips),  digits);
-   double buyTp =NormalizeDouble(buyStopPrice +PipsToPrice(_Symbol,InpTakeProfitPips),digits);
-   double sellSl=NormalizeDouble(sellStopPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
-   double sellTp=NormalizeDouble(sellStopPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
+   double buySl,buyTp,sellSl,sellTp;
+
+   if(InpUseVirtualExits)
+     {
+      // No real TP (a missed TP just leaves a winner open, not an account risk), and a
+      // wide real SL kept only as a crash/disconnect backstop - the tight virtual SL
+      // below is what actually protects the trade under normal operation.
+      double backstopPips=InpStopLossPips*InpBackstopSLMultiplier;
+      buySl =NormalizeDouble(buyStopPrice -PipsToPrice(_Symbol,backstopPips),digits);
+      buyTp =0.0;
+      sellSl=NormalizeDouble(sellStopPrice+PipsToPrice(_Symbol,backstopPips),digits);
+      sellTp=0.0;
+     }
+   else
+     {
+      buySl =NormalizeDouble(buyStopPrice -PipsToPrice(_Symbol,InpStopLossPips),  digits);
+      buyTp =NormalizeDouble(buyStopPrice +PipsToPrice(_Symbol,InpTakeProfitPips),digits);
+      sellSl=NormalizeDouble(sellStopPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
+      sellTp=NormalizeDouble(sellStopPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
+     }
 
    ENUM_ORDER_TYPE_TIME typeTime=ORDER_TIME_GTC;
    datetime expiration=0;
@@ -316,6 +341,105 @@ void ManageBreakeven()
             if(trade.PositionModify(tickets[i],beSl,tp))
                Print("Breakeven applied to #",tickets[i]," new SL=",DoubleToString(beSl,digits));
            }
+        }
+     }
+  }
+
+bool IsBreakevenArmed(ulong ticket)
+  {
+   for(int i=0;i<ArraySize(g_breakevenArmedTickets);i++)
+      if(g_breakevenArmedTickets[i]==ticket)
+         return true;
+   return false;
+  }
+
+void ArmBreakeven(ulong ticket)
+  {
+   if(IsBreakevenArmed(ticket)) return;
+   int n=ArraySize(g_breakevenArmedTickets);
+   ArrayResize(g_breakevenArmedTickets,n+1);
+   g_breakevenArmedTickets[n]=ticket;
+  }
+
+// Breakeven-armed state can't be derived from current price alone (it depends on
+// whether profit ever reached the trigger), so unlike the rest of this EA's checks
+// it needs to persist across ticks - this drops entries for positions that closed.
+void PruneBreakevenArmedTickets(const string symbol,ulong magic)
+  {
+   ulong openTickets[];
+   int openCount=GetPositionTickets(symbol,magic,openTickets);
+   for(int i=ArraySize(g_breakevenArmedTickets)-1;i>=0;i--)
+     {
+      bool stillOpen=false;
+      for(int j=0;j<openCount;j++)
+         if(openTickets[j]==g_breakevenArmedTickets[i]) { stillOpen=true; break; }
+      if(!stillOpen)
+         ArrayRemove(g_breakevenArmedTickets,i,1);
+     }
+  }
+
+void CloseVirtual(ulong ticket,string reason)
+  {
+   if(trade.PositionClose(ticket))
+      Print("Closed position #",ticket," via ",reason);
+   else
+      Print("Failed to close position #",ticket," (",reason,") error=",GetLastError());
+  }
+
+// EA-side TP/SL/breakeven: the broker only holds a wide backstop SL (see
+// PlaceBreakoutStops), so under normal operation this is what actually exits trades.
+void ManageVirtualExits()
+  {
+   ulong tickets[];
+   int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
+   if(n==0) return;
+
+   PruneBreakevenArmedTickets(_Symbol,InpMagicNumber);
+
+   double spreadPips=CurrentSpreadPips(_Symbol);
+   double bePips=spreadPips+InpBreakevenBufferPips;
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   for(int i=0;i<n;i++)
+     {
+      if(!PositionSelectByTicket(tickets[i]))
+         continue;
+
+      long type=PositionGetInteger(POSITION_TYPE);
+      double entry=PositionGetDouble(POSITION_PRICE_OPEN);
+
+      if(type==POSITION_TYPE_BUY)
+        {
+         double profitPips=PriceToPips(_Symbol,bid-entry);
+         double virtualTp=entry+PipsToPrice(_Symbol,InpTakeProfitPips);
+         double virtualSl=entry-PipsToPrice(_Symbol,InpStopLossPips);
+
+         if(!IsBreakevenArmed(tickets[i]) && profitPips>=InpBreakevenTriggerPips)
+            ArmBreakeven(tickets[i]);
+         if(IsBreakevenArmed(tickets[i]))
+            virtualSl=entry+PipsToPrice(_Symbol,bePips);
+
+         if(bid>=virtualTp)
+            CloseVirtual(tickets[i],"virtual TP");
+         else if(bid<=virtualSl)
+            CloseVirtual(tickets[i],"virtual SL");
+        }
+      else if(type==POSITION_TYPE_SELL)
+        {
+         double profitPips=PriceToPips(_Symbol,entry-ask);
+         double virtualTp=entry-PipsToPrice(_Symbol,InpTakeProfitPips);
+         double virtualSl=entry+PipsToPrice(_Symbol,InpStopLossPips);
+
+         if(!IsBreakevenArmed(tickets[i]) && profitPips>=InpBreakevenTriggerPips)
+            ArmBreakeven(tickets[i]);
+         if(IsBreakevenArmed(tickets[i]))
+            virtualSl=entry-PipsToPrice(_Symbol,bePips);
+
+         if(ask<=virtualTp)
+            CloseVirtual(tickets[i],"virtual TP");
+         else if(ask>=virtualSl)
+            CloseVirtual(tickets[i],"virtual SL");
         }
      }
   }
