@@ -135,10 +135,28 @@ broker-side protection than hidden lines.
 
 1. Copy `MQL5/Experts/BreakoutStopBot.mq5` and the
    `MQL5/Include/BreakoutStopBot/` folder into your terminal's `MQL5/Experts`
-   and `MQL5/Include` directories (Data Folder → `MQL5/`).
-2. Compile `BreakoutStopBot.mq5` in MetaEditor.
-3. Attach to a chart matching `InpTimeframe` (M1/M3/M5), enable AutoTrading,
-   set inputs.
+   and `MQL5/Include` directories (Data Folder → `MQL5/`) — **not** into a
+   subfolder that nests another `MQL5/Experts/...` inside it. If you clone
+   this whole repo directly under your terminal's `MQL5/Experts/`, the
+   `Include/BreakoutStopBot/` folder ends up one level too deep for the
+   include paths to resolve; the `.mq5` uses relative includes
+   (`../Include/BreakoutStopBot/...`) specifically so the repo layout still
+   works as long as `MQL5/Experts/BreakoutStopBot.mq5` and
+   `MQL5/Include/BreakoutStopBot/*.mqh` keep that same relative position to
+   each other, wherever the repo folder itself sits.
+2. Compile `BreakoutStopBot.mq5` in MetaEditor and check the **Errors** tab
+   shows 0 errors — if includes can't be found, the old `.ex5` on disk is
+   left untouched and MT5 will keep running stale behavior without any
+   obvious warning.
+3. **Remove and re-attach the EA** on the chart after recompiling — MT5 does
+   not hot-reload a running EA instance's code, so a chart that already had
+   the EA attached before you recompiled will keep executing the old binary
+   until you detach and re-attach it (or restart the terminal).
+4. Attach to a chart matching `InpTimeframe` (M1/M3/M5), enable AutoTrading,
+   set inputs. Check the **Experts/Journal** log for the
+   `BreakoutStopBot init: ...` line printed on startup — it echoes the
+   active timeframe, TP/SL, virtual-exits setting, backstop SL distance, and
+   trade-levels setting, so you can confirm what's actually running.
 
 ## Known limitations / risks
 

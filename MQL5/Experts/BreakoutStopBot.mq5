@@ -5,9 +5,9 @@
 #property description "high/low every bar (OCO pair), manages TP/SL, breakeven, early drawdown exit."
 
 #include <Trade/Trade.mqh>
-#include <BreakoutStopBot/TradeUtils.mqh>
-#include <BreakoutStopBot/RiskManager.mqh>
-#include <BreakoutStopBot/Dashboard.mqh>
+#include "../Include/BreakoutStopBot/TradeUtils.mqh"
+#include "../Include/BreakoutStopBot/RiskManager.mqh"
+#include "../Include/BreakoutStopBot/Dashboard.mqh"
 
 // Capped at M1/M3/M5 - this is a short-timeframe breakout system and isn't
 // intended (or validated) for slower candles.
@@ -94,6 +94,12 @@ int OnInit()
             "run it on a matching chart for accurate new-bar timing.");
 
    g_lastBarTime=iTime(_Symbol,g_timeframe,0);
+
+   Print("BreakoutStopBot init: timeframe=",TimeframeLabel(g_timeframe),
+         " TP=",DoubleToString(InpTakeProfitPips,1),"pips SL=",DoubleToString(InpStopLossPips,1),"pips",
+         " virtualExits=",InpUseVirtualExits,
+         " backstopSL=",DoubleToString(InpStopLossPips*InpBackstopSLMultiplier,1),"pips",
+         " hideTradeLevels=",InpHideTradeLevels);
 
    g_originalShowTradeLevels=(bool)ChartGetInteger(0,CHART_SHOW_TRADE_LEVELS);
    if(InpHideTradeLevels)
