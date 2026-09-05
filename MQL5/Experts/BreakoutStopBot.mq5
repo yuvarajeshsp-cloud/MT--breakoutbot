@@ -19,6 +19,20 @@ enum ENUM_BOT_TIMEFRAME
    BOT_PERIOD_M5=PERIOD_M5
   };
 
+// How CloseDrawdownPositions decides a losing position should be cut early,
+// rather than left to run to its real SL. ANY_LOSS (the original behavior)
+// closes on any floating loss at all, however small - since a fresh position
+// is valued at the opposite side of the spread from where it entered, this
+// can realize a small loss on spread noise alone before a trade has any real
+// chance to develop. The other three modes require an actual adverse move.
+enum ENUM_DRAWDOWN_CLOSE_MODE
+  {
+   DRAWDOWN_CLOSE_ANY_LOSS,       // Close on any floating loss at all (original behavior)
+   DRAWDOWN_CLOSE_MIN_THRESHOLD,  // Close only once the loss exceeds InpDrawdownMinLossPips
+   DRAWDOWN_CLOSE_WAIT_CANDLES,   // Close only if still negative after InpDrawdownGraceCandles closes
+   DRAWDOWN_CLOSE_PERCENT_OF_SL   // Close once the loss reaches InpDrawdownPercentOfSL % of InpStopLossPips
+  };
+
 input group "=== Timeframe ==="
 input ENUM_BOT_TIMEFRAME InpTimeframe = BOT_PERIOD_M1;  // Candle timeframe (M1/M3/M5 only)
 
@@ -43,6 +57,12 @@ input double InpLotSize                = 0.01;   // Fixed lot size (if !InpUseRi
 input group "=== Risk Controls ==="
 input int    InpMaxConcurrentPositions = 3;      // Max simultaneously open positions from this EA
 input double InpMaxSpreadPips          = 3.0;    // Skip placing new stops if spread exceeds this; 0 = disabled
+
+input group "=== Drawdown Close ==="
+input ENUM_DRAWDOWN_CLOSE_MODE InpDrawdownCloseMode = DRAWDOWN_CLOSE_MIN_THRESHOLD; // How to decide when to close a losing position early
+input double InpDrawdownMinLossPips    = 3.0;    // (Min Threshold mode) Close only once loss exceeds this many pips
+input int    InpDrawdownGraceCandles   = 2;      // (Wait N Candles mode) Consecutive negative closes allowed before closing
+input double InpDrawdownPercentOfSL    = 50.0;   // (Percent of SL mode) Close once loss reaches this % of InpStopLossPips
 
 input group "=== Session Filter ==="
 input bool   InpUseSessionFilter       = false;  // Restrict new stop placement to a time window
@@ -74,6 +94,60 @@ ulong            g_pendingBuyStopTicket = 0;
 ulong            g_pendingSellStopTicket= 0;
 int              g_lastFlattenDay       = -1;
 
+// Consecutive-negative-candle-close counter per position, used only by
+// DRAWDOWN_CLOSE_WAIT_CANDLES mode - resets to 0 the moment a position is no
+// longer negative at a candle close, since "still negative" must be an
+// unbroken streak, not just N negative closes at any point in its life.
+struct DrawdownStreak
+  {
+   ulong ticket;
+   int   negativeCloses;
+  };
+DrawdownStreak g_drawdownStreaks[];
+
+int FindDrawdownStreak(ulong ticket)
+  {
+   for(int i=0;i<ArraySize(g_drawdownStreaks);i++)
+      if(g_drawdownStreaks[i].ticket==ticket)
+         return i;
+   return -1;
+  }
+
+int IncrementDrawdownStreak(ulong ticket)
+  {
+   int idx=FindDrawdownStreak(ticket);
+   if(idx<0)
+     {
+      idx=ArraySize(g_drawdownStreaks);
+      ArrayResize(g_drawdownStreaks,idx+1);
+      g_drawdownStreaks[idx].ticket=ticket;
+      g_drawdownStreaks[idx].negativeCloses=0;
+     }
+   g_drawdownStreaks[idx].negativeCloses++;
+   return g_drawdownStreaks[idx].negativeCloses;
+  }
+
+void ResetDrawdownStreak(ulong ticket)
+  {
+   int idx=FindDrawdownStreak(ticket);
+   if(idx>=0)
+      g_drawdownStreaks[idx].negativeCloses=0;
+  }
+
+void PruneDrawdownStreaks(const string symbol,ulong magic)
+  {
+   ulong openTickets[];
+   int openCount=GetPositionTickets(symbol,magic,openTickets);
+   for(int i=ArraySize(g_drawdownStreaks)-1;i>=0;i--)
+     {
+      bool stillOpen=false;
+      for(int j=0;j<openCount;j++)
+         if(openTickets[j]==g_drawdownStreaks[i].ticket) { stillOpen=true; break; }
+      if(!stillOpen)
+         ArrayRemove(g_drawdownStreaks,i,1);
+     }
+  }
+
 int OnInit()
   {
    g_timeframe=(ENUM_TIMEFRAMES)InpTimeframe;
@@ -102,6 +176,7 @@ int OnInit()
          " TP=",DoubleToString(InpTakeProfitPips,1),"pips SL=",DoubleToString(InpStopLossPips,1),"pips",
          " breakevenTrigger=",DoubleToString(InpBreakevenTriggerPips,1),"pips",
          " latencyBuffer=",DoubleToString(InpLatencyBufferPips,1),"pips",
+         " drawdownCloseMode=",EnumToString(InpDrawdownCloseMode),
          " volumeFilter=",InpUseVolumeFilter,"(",InpVolumeLookbackBars,"bars,>=",DoubleToString(InpMinVolumeRatio,2),"x)",
          " sessionFilter=",InpUseSessionFilter,
          " dailyFlatten=",InpUseDailyFlatten,"(hour ",InpDailyFlattenHour,")");
@@ -276,12 +351,50 @@ void CloseDrawdownPositions()
   {
    ulong tickets[];
    int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
+
+   if(InpDrawdownCloseMode==DRAWDOWN_CLOSE_WAIT_CANDLES)
+      PruneDrawdownStreaks(_Symbol,InpMagicNumber);
+
    for(int i=0;i<n;i++)
      {
       if(!PositionSelectByTicket(tickets[i]))
          continue;
+
       double profit=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
-      if(profit<0.0)
+      long type=PositionGetInteger(POSITION_TYPE);
+      double entry=PositionGetDouble(POSITION_PRICE_OPEN);
+      double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+      double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+      // Positive when currently in a loss, by however many pips; zero or negative
+      // once at/above breakeven. Used by every mode except the original ANY_LOSS.
+      double lossPips=(type==POSITION_TYPE_BUY)
+                       ? PriceToPips(_Symbol,entry-bid)
+                       : PriceToPips(_Symbol,ask-entry);
+
+      bool shouldClose=false;
+      switch(InpDrawdownCloseMode)
+        {
+         case DRAWDOWN_CLOSE_ANY_LOSS:
+            shouldClose=(profit<0.0);
+            break;
+         case DRAWDOWN_CLOSE_MIN_THRESHOLD:
+            shouldClose=(lossPips>=InpDrawdownMinLossPips);
+            break;
+         case DRAWDOWN_CLOSE_PERCENT_OF_SL:
+            shouldClose=(lossPips>=InpStopLossPips*InpDrawdownPercentOfSL/100.0);
+            break;
+         case DRAWDOWN_CLOSE_WAIT_CANDLES:
+            if(lossPips>0.0)
+              {
+               int streak=IncrementDrawdownStreak(tickets[i]);
+               shouldClose=(streak>=InpDrawdownGraceCandles);
+              }
+            else
+               ResetDrawdownStreak(tickets[i]);
+            break;
+        }
+
+      if(shouldClose)
         {
          if(trade.PositionClose(tickets[i]))
             Print("Closed drawdown position #",tickets[i]," profit=",DoubleToString(profit,2));

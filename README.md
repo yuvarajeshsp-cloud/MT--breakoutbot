@@ -33,9 +33,9 @@ Every tick:
    across EA restarts and self-heals if a modify is rejected.
 
 On every new candle (once, at the bar's first tick):
-1. **Drawdown close** — any open position (from this EA) currently in
-   floating loss is closed at market immediately, rather than waiting for the
-   fixed stop loss.
+1. **Drawdown close** — decides whether to cut a losing position early rather
+   than wait for the fixed stop loss; behavior depends on
+   `InpDrawdownCloseMode` (see Drawdown Close Modes below).
 2. **Stale order cleanup** — the previous bar's Buy Stop / Sell Stop are
    cancelled if they never filled.
 3. **New OCO pair** — if spread, session, and volume filters pass and the EA
@@ -65,6 +65,10 @@ current positions.
 | `InpLotSize` | 0.01 | Fixed lot size (if not using risk-percent sizing) |
 | `InpMaxConcurrentPositions` | 3 | Cap on simultaneously open positions from this EA |
 | `InpMaxSpreadPips` | 3.0 | Skip placing new stops this bar if spread exceeds this; `0` disables the filter |
+| `InpDrawdownCloseMode` | Min Threshold | How to decide when to close a losing position early (see Drawdown Close Modes below) |
+| `InpDrawdownMinLossPips` | 3.0 | (Min Threshold mode) Close only once the loss exceeds this many pips |
+| `InpDrawdownGraceCandles` | 2 | (Wait N Candles mode) Consecutive negative closes allowed before closing |
+| `InpDrawdownPercentOfSL` | 50.0 | (Percent of SL mode) Close once loss reaches this % of `InpStopLossPips` |
 | `InpUseSessionFilter` | false | Restrict new stop placement to a server-time window |
 | `InpTradingStartHour` / `InpTradingEndHour` | 0 / 24 | Session window (server time, hour granularity) |
 | `InpUseVolumeFilter` | true | Only place new stops when the closed candle's tick volume is above the recent average |
@@ -133,6 +137,37 @@ also want to block new entries during a window).
    active timeframe, TP/SL, breakeven trigger, volume filter, session
    filter, and daily flatten settings, so you can confirm what's actually
    running.
+
+## Drawdown Close Modes
+
+A freshly-opened position is valued at the opposite side of the spread from
+where it entered (bought at Ask, marked to market at Bid), so it typically
+starts out slightly negative from spread alone, independent of whether the
+trade idea was any good. `InpDrawdownCloseMode` controls how much room a
+losing position gets before it's cut, rather than left to run to the real
+stop loss:
+
+- **Any Loss** (`DRAWDOWN_CLOSE_ANY_LOSS`, the original behavior): closes on
+  any floating loss at all, however small. Simple, but can realize a small
+  loss on ordinary spread noise before a trade has any real chance to
+  develop — this is a likely contributor if you see more/smaller losing
+  trades on realistic spread data than on tighter backtest conditions.
+- **Min Threshold** (`DRAWDOWN_CLOSE_MIN_THRESHOLD`, default): only closes
+  once the loss exceeds `InpDrawdownMinLossPips`. Set this above your typical
+  spread so ordinary noise doesn't trigger it, but a real adverse move still
+  does.
+- **Wait N Candles** (`DRAWDOWN_CLOSE_WAIT_CANDLES`): only closes if the
+  position has been negative at `InpDrawdownGraceCandles` *consecutive*
+  candle closes in a row — a candle where it's no longer negative resets the
+  count. Gives a trade time to develop before being judged.
+- **Percent of SL** (`DRAWDOWN_CLOSE_PERCENT_OF_SL`): closes once the loss
+  reaches `InpDrawdownPercentOfSL`% of `InpStopLossPips`, scaling
+  automatically with whatever SL you configure.
+
+All three non-original modes compare against the position's floating loss in
+pips (not currency), computed from entry vs. current Bid/Ask in the losing
+direction. Switching modes, or changing `InpStopLossPips`, takes effect
+immediately on the next candle close — no restart needed.
 
 ## Backtesting: "Every tick" vs "Every tick based on real ticks"
 
