@@ -27,9 +27,10 @@ Every tick:
    or disappeared while the other is still pending, the sibling is cancelled.
 3. **Breakeven** — for each open position, if floating profit has reached
    `InpBreakevenTriggerPips`, the real stop loss moves to
-   `entry ± (current spread + InpBreakevenBufferPips)`, locking in a small
-   guaranteed profit. Recomputed idempotently every tick from position state
-   (no separate "already armed" flag), so it's safe across EA restarts.
+   `entry ± (current spread + InpBreakevenBufferPips + InpLatencyBufferPips)`,
+   locking in a small guaranteed profit. Recomputed idempotently every tick
+   from position state (no separate "already armed" flag), so it's safe
+   across EA restarts and self-heals if a modify is rejected.
 
 On every new candle (once, at the bar's first tick):
 1. **Drawdown close** — any open position (from this EA) currently in
@@ -56,6 +57,7 @@ current positions.
 | `InpStopLossPips` | 50 | Stop loss distance from entry, in pips |
 | `InpBreakevenTriggerPips` | 20 | Floating profit needed before breakeven arms |
 | `InpBreakevenBufferPips` | 0.25 | Extra pips locked in beyond spread at breakeven |
+| `InpLatencyBufferPips` | 1.0 | Extra pips added to the breakeven lock to survive round-trip order latency to your broker |
 | `InpEntryBufferPips` | 0 | Offset added beyond the prior candle's high/low |
 | `InpPendingExpiryMinutes` | 0 | Pending order expiry; 0 = GTC (orders are replaced every bar regardless) |
 | `InpUseRiskPercent` | false | Use risk-percent position sizing instead of a fixed lot |
@@ -131,6 +133,48 @@ also want to block new entries during a window).
    active timeframe, TP/SL, breakeven trigger, volume filter, session
    filter, and daily flatten settings, so you can confirm what's actually
    running.
+
+## Backtesting: "Every tick" vs "Every tick based on real ticks"
+
+These two Strategy Tester modes can show very different results for the same
+EA and inputs, and that gap is itself meaningful information, not a bug:
+
+- **"Every tick" (generated)** synthesizes intrabar price movement from OHLC
+  bars using MT5's own interpolation, not real historical bid/ask data. For a
+  system whose entries depend on exact price levels (a breakout stop-entry
+  system, here), this can be more forgiving than reality — smoother paths,
+  no real spread-widening events, no genuine quote gaps.
+- **"Every tick based on real ticks"** replays actual historical tick data
+  for the symbol, when your broker/data source has it. This is the closest
+  the Strategy Tester gets to real execution.
+
+If a strategy is profitable under generated ticks but draws down under real
+ticks, that's the real-tick run telling you the apparent edge was likely an
+artifact of synthetic data, not a real, repeatable market pattern — treat the
+real-tick result as the credible one, and don't keep adjusting inputs just to
+make the generated-tick run look good again; that's fitting noise, not
+finding an edge.
+
+**Calibrating for your actual latency**: the Strategy Tester's "Delays"
+setting (in the tester's configuration panel, alongside the "Modelling"
+dropdown) simulates the round-trip delay between the EA deciding to act and
+that action landing on the broker's server. Set it to your real observed
+ping to the broker (e.g. 145ms) so the backtest reflects your actual
+execution conditions. This matters most for `ManageBreakeven()`'s
+`trade.PositionModify()` calls and `CloseDrawdownPositions()`'s
+`trade.PositionClose()` calls — both compute a target price from the current
+tick, then send a request that only takes effect after the round trip, by
+which point price may have moved. `InpLatencyBufferPips` widens the
+breakeven lock specifically to survive that gap; there's no equivalent needed
+for pending Buy Stop/Sell Stop orders, since those are triggered by the
+broker's own server-side price feed once resting, not by the EA's client-side
+timing.
+
+No amount of latency-buffer tuning turns a strategy without a real edge into
+a profitable one, though — it only makes the EA's own order handling honest
+about a real, fixed constraint (your connection). If real-tick backtests
+stay unprofitable after this, that's a signal about the strategy itself, not
+something to engineer around with more parameters.
 
 ## Known limitations / risks
 

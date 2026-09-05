@@ -29,6 +29,7 @@ input double InpStopLossPips           = 50.0;   // Stop loss distance (pips)
 input group "=== Breakeven ==="
 input double InpBreakevenTriggerPips   = 20.0;   // Floating profit (pips) needed before breakeven arms
 input double InpBreakevenBufferPips    = 0.25;   // Extra pips locked in beyond spread at breakeven
+input double InpLatencyBufferPips      = 1.0;    // Extra pips added to the breakeven lock to survive round-trip order latency
 
 input group "=== Entry ==="
 input double InpEntryBufferPips        = 0.0;    // Offset beyond prior candle's high/low
@@ -100,6 +101,7 @@ int OnInit()
    Print("BreakoutStopBot init: timeframe=",TimeframeLabel(g_timeframe),
          " TP=",DoubleToString(InpTakeProfitPips,1),"pips SL=",DoubleToString(InpStopLossPips,1),"pips",
          " breakevenTrigger=",DoubleToString(InpBreakevenTriggerPips,1),"pips",
+         " latencyBuffer=",DoubleToString(InpLatencyBufferPips,1),"pips",
          " volumeFilter=",InpUseVolumeFilter,"(",InpVolumeLookbackBars,"bars,>=",DoubleToString(InpMinVolumeRatio,2),"x)",
          " sessionFilter=",InpUseSessionFilter,
          " dailyFlatten=",InpUseDailyFlatten,"(hour ",InpDailyFlattenHour,")");
@@ -291,6 +293,11 @@ void CloseDrawdownPositions()
 
 // Idempotent breakeven check: recomputes the target SL from position state every call,
 // so it self-heals across EA restarts without needing separate "already armed" tracking.
+// InpLatencyBufferPips widens the lock beyond spread+buffer specifically to survive the
+// round trip between computing beSl here and the modify actually landing on the server -
+// by then price may have moved, so a too-tight lock risks an invalid-stops rejection or
+// executing at a worse level than intended. Self-heals on failure too: a rejected modify
+// just gets recomputed and retried from current price on the next tick.
 void ManageBreakeven()
   {
    ulong tickets[];
@@ -298,7 +305,7 @@ void ManageBreakeven()
    if(n==0) return;
 
    double spreadPips=CurrentSpreadPips(_Symbol);
-   double bePips=spreadPips+InpBreakevenBufferPips;
+   double bePips=spreadPips+InpBreakevenBufferPips+InpLatencyBufferPips;
    double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
@@ -321,6 +328,9 @@ void ManageBreakeven()
            {
             if(trade.PositionModify(tickets[i],beSl,tp))
                Print("Breakeven applied to #",tickets[i]," new SL=",DoubleToString(beSl,digits));
+            else
+               Print("Breakeven modify failed for #",tickets[i]," error=",GetLastError(),
+                     " (will recompute and retry next tick)");
            }
         }
       else if(type==POSITION_TYPE_SELL)
@@ -331,6 +341,9 @@ void ManageBreakeven()
            {
             if(trade.PositionModify(tickets[i],beSl,tp))
                Print("Breakeven applied to #",tickets[i]," new SL=",DoubleToString(beSl,digits));
+            else
+               Print("Breakeven modify failed for #",tickets[i]," error=",GetLastError(),
+                     " (will recompute and retry next tick)");
            }
         }
      }
