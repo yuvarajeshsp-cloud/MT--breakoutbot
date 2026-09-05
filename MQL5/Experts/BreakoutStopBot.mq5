@@ -47,6 +47,11 @@ input bool   InpUseSessionFilter       = false;  // Restrict new stop placement 
 input int    InpTradingStartHour       = 0;      // Server-time hour, inclusive
 input int    InpTradingEndHour         = 24;     // Server-time hour, exclusive
 
+input group "=== Volume Filter ==="
+input bool   InpUseVolumeFilter        = true;   // Only place new stops when the candle's tick volume is above the recent average
+input int    InpVolumeLookbackBars     = 20;     // Number of prior candles averaged for comparison
+input double InpMinVolumeRatio         = 1.0;    // Required ratio: candle volume >= this x average volume
+
 input group "=== Execution ==="
 input int    InpSlippagePips           = 2;      // Max slippage for market operations (pips)
 input ulong  InpMagicNumber            = 20260904;
@@ -99,7 +104,8 @@ int OnInit()
          " TP=",DoubleToString(InpTakeProfitPips,1),"pips SL=",DoubleToString(InpStopLossPips,1),"pips",
          " virtualExits=",InpUseVirtualExits,
          " backstopSL=",DoubleToString(InpStopLossPips*InpBackstopSLMultiplier,1),"pips",
-         " hideTradeLevels=",InpHideTradeLevels);
+         " hideTradeLevels=",InpHideTradeLevels,
+         " volumeFilter=",InpUseVolumeFilter,"(",InpVolumeLookbackBars,"bars,>=",DoubleToString(InpMinVolumeRatio,2),"x)");
 
    g_originalShowTradeLevels=(bool)ChartGetInteger(0,CHART_SHOW_TRADE_LEVELS);
    if(InpHideTradeLevels)
@@ -171,6 +177,13 @@ void OnNewBar()
 
    if(InpUseSessionFilter && !WithinSession())
       return;
+
+   if(!VolumeOk())
+     {
+      Print("Candle volume below ",DoubleToString(InpMinVolumeRatio,2),"x the ",InpVolumeLookbackBars,
+            "-bar average, skipping new stop orders this bar.");
+      return;
+     }
 
    int openCount=CountPositionsByMagic(_Symbol,InpMagicNumber);
    if(openCount>=InpMaxConcurrentPositions)
@@ -458,6 +471,35 @@ bool SpreadOk()
    if(InpMaxSpreadPips<=0.0)
       return true;
    return CurrentSpreadPips(_Symbol)<=InpMaxSpreadPips;
+  }
+
+// Compares the just-closed candle's tick volume (the one whose high/low defines this
+// bar's breakout levels) against the average of the preceding InpVolumeLookbackBars
+// candles, so stops are only placed once activity picks up rather than every bar.
+bool VolumeOk()
+  {
+   if(!InpUseVolumeFilter || InpVolumeLookbackBars<=0)
+      return true;
+
+   long currentVolume=iVolume(_Symbol,g_timeframe,1);
+
+   long sum=0;
+   int count=0;
+   for(int i=2;i<2+InpVolumeLookbackBars;i++)
+     {
+      long v=iVolume(_Symbol,g_timeframe,i);
+      if(v<=0) continue;
+      sum+=v;
+      count++;
+     }
+   if(count==0)
+      return true;
+
+   double avgVolume=(double)sum/count;
+   if(avgVolume<=0.0)
+      return true;
+
+   return currentVolume>=InpMinVolumeRatio*avgVolume;
   }
 
 bool WithinSession()

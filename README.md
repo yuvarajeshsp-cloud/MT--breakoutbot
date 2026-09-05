@@ -34,8 +34,8 @@ On every new candle (once, at the bar's first tick):
    fixed stop loss.
 2. **Stale order cleanup** — the previous bar's Buy Stop / Sell Stop are
    cancelled if they never filled.
-3. **New OCO pair** — if spread and session filters pass and the EA is below
-   `InpMaxConcurrentPositions`, a fresh Buy Stop is placed at
+3. **New OCO pair** — if spread, session, and volume filters pass and the EA
+   is below `InpMaxConcurrentPositions`, a fresh Buy Stop is placed at
    `previous candle high + InpEntryBufferPips` and a fresh Sell Stop at
    `previous candle low − InpEntryBufferPips`, each with its own
    `InpTakeProfitPips` / `InpStopLossPips`.
@@ -62,6 +62,9 @@ current positions.
 | `InpMaxSpreadPips` | 3.0 | Skip placing new stops this bar if spread exceeds this; `0` disables the filter |
 | `InpUseSessionFilter` | false | Restrict new stop placement to a server-time window |
 | `InpTradingStartHour` / `InpTradingEndHour` | 0 / 24 | Session window (server time, hour granularity) |
+| `InpUseVolumeFilter` | true | Only place new stops when the closed candle's tick volume is above the recent average |
+| `InpVolumeLookbackBars` | 20 | Number of prior candles averaged for the volume comparison |
+| `InpMinVolumeRatio` | 1.0 | Required ratio: candle volume must be ≥ this × the lookback average |
 | `InpSlippagePips` | 2 | Max slippage allowed for market operations (e.g. drawdown close) |
 | `InpMagicNumber` | 20260904 | Identifies this EA's orders/positions |
 | `InpCancelPendingOnRemove` | true | Cancel this EA's pending stop orders when it's removed from the chart |
@@ -160,6 +163,11 @@ broker-side protection than hidden lines.
 
 ## Known limitations / risks
 
+- **Tick volume, not exchange volume**: `InpUseVolumeFilter` uses MT5 tick
+  volume (count of price changes per candle), since most forex/CFD brokers —
+  including most gold CFD symbols — report zero real/exchange volume, which
+  would silently block all trading forever if the filter required it. Tick
+  volume is a reasonable proxy for activity but isn't literal traded volume.
 - **Weekend / news gap risk**: resting stop orders through low-liquidity
   periods can fill with large slippage. Consider adding a news-avoidance or
   Friday-close-avoidance guard if you trade through those windows —
