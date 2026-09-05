@@ -1,8 +1,9 @@
 #property copyright "BreakoutStopBot"
 #property version   "1.00"
 #property strict
-#property description "Candle breakout bot: places Buy Stop / Sell Stop at the prior candle's "
-#property description "high/low every bar (OCO pair), manages TP/SL, breakeven, early drawdown exit."
+#property description "Candle breakout bot: places an OCO pair at the prior candle's high/low "
+#property description "every bar (Buy Stop/Sell Stop, or Sell Limit/Buy Limit to fade in reverse "
+#property description "mode), manages TP/SL, breakeven, early drawdown exit."
 
 #include <Trade/Trade.mqh>
 #include "../Include/BreakoutStopBot/TradeUtils.mqh"
@@ -32,6 +33,7 @@ input double InpBreakevenBufferPips    = 0.25;   // Extra pips locked in beyond 
 input group "=== Entry ==="
 input double InpEntryBufferPips        = 0.0;    // Offset beyond prior candle's high/low
 input int    InpPendingExpiryMinutes   = 0;       // 0 = GTC (orders are replaced every bar regardless)
+input bool   InpReverseSignal          = false;  // Fade the breakout instead of following it: Sell Limit at prior high, Buy Limit at prior low
 
 input group "=== Position Sizing ==="
 input bool   InpUseRiskPercent         = false;  // Use risk-percent sizing instead of fixed lot
@@ -71,8 +73,8 @@ input double InpBackstopSLMultiplier   = 4.0;    // Real broker-side SL = InpSto
 CTrade           trade;
 ENUM_TIMEFRAMES  g_timeframe             = PERIOD_M1;
 datetime         g_lastBarTime           = 0;
-ulong            g_pendingBuyStopTicket  = 0;
-ulong            g_pendingSellStopTicket = 0;
+ulong            g_pendingUpperTicket    = 0;
+ulong            g_pendingLowerTicket    = 0;
 bool             g_originalShowTradeLevels = true;
 ulong            g_breakevenArmedTickets[];
 
@@ -105,7 +107,8 @@ int OnInit()
          " virtualExits=",InpUseVirtualExits,
          " backstopSL=",DoubleToString(InpStopLossPips*InpBackstopSLMultiplier,1),"pips",
          " hideTradeLevels=",InpHideTradeLevels,
-         " volumeFilter=",InpUseVolumeFilter,"(",InpVolumeLookbackBars,"bars,>=",DoubleToString(InpMinVolumeRatio,2),"x)");
+         " volumeFilter=",InpUseVolumeFilter,"(",InpVolumeLookbackBars,"bars,>=",DoubleToString(InpMinVolumeRatio,2),"x)",
+         " reverseSignal=",InpReverseSignal);
 
    g_originalShowTradeLevels=(bool)ChartGetInteger(0,CHART_SHOW_TRADE_LEVELS);
    if(InpHideTradeLevels)
@@ -134,10 +137,10 @@ void OnDeinit(const int reason)
 
    if(InpCancelPendingOnRemove && reason==REASON_REMOVE)
      {
-      if(g_pendingBuyStopTicket!=0 && OrderSelect(g_pendingBuyStopTicket))
-         trade.OrderDelete(g_pendingBuyStopTicket);
-      if(g_pendingSellStopTicket!=0 && OrderSelect(g_pendingSellStopTicket))
-         trade.OrderDelete(g_pendingSellStopTicket);
+      if(g_pendingUpperTicket!=0 && OrderSelect(g_pendingUpperTicket))
+         trade.OrderDelete(g_pendingUpperTicket);
+      if(g_pendingLowerTicket!=0 && OrderSelect(g_pendingLowerTicket))
+         trade.OrderDelete(g_pendingLowerTicket);
      }
   }
 
@@ -200,17 +203,17 @@ void OnNewBar()
 // don't accumulate. Positions already open are left untouched.
 void CancelStalePendingOrders()
   {
-   if(g_pendingBuyStopTicket!=0)
+   if(g_pendingUpperTicket!=0)
      {
-      if(OrderSelect(g_pendingBuyStopTicket))
-         trade.OrderDelete(g_pendingBuyStopTicket);
-      g_pendingBuyStopTicket=0;
+      if(OrderSelect(g_pendingUpperTicket))
+         trade.OrderDelete(g_pendingUpperTicket);
+      g_pendingUpperTicket=0;
      }
-   if(g_pendingSellStopTicket!=0)
+   if(g_pendingLowerTicket!=0)
      {
-      if(OrderSelect(g_pendingSellStopTicket))
-         trade.OrderDelete(g_pendingSellStopTicket);
-      g_pendingSellStopTicket=0;
+      if(OrderSelect(g_pendingLowerTicket))
+         trade.OrderDelete(g_pendingLowerTicket);
+      g_pendingLowerTicket=0;
      }
   }
 
@@ -218,29 +221,33 @@ void CancelStalePendingOrders()
 // pending, cancel the sibling so only one direction can be active at a time.
 void EnforceOco()
   {
-   if(g_pendingBuyStopTicket==0 && g_pendingSellStopTicket==0)
+   if(g_pendingUpperTicket==0 && g_pendingLowerTicket==0)
       return;
 
-   bool buyExists =g_pendingBuyStopTicket!=0  && OrderSelect(g_pendingBuyStopTicket);
-   bool sellExists=g_pendingSellStopTicket!=0 && OrderSelect(g_pendingSellStopTicket);
+   bool upperExists=g_pendingUpperTicket!=0 && OrderSelect(g_pendingUpperTicket);
+   bool lowerExists=g_pendingLowerTicket!=0 && OrderSelect(g_pendingLowerTicket);
 
-   if(g_pendingBuyStopTicket!=0 && !buyExists)
-      g_pendingBuyStopTicket=0;
-   if(g_pendingSellStopTicket!=0 && !sellExists)
-      g_pendingSellStopTicket=0;
+   if(g_pendingUpperTicket!=0 && !upperExists)
+      g_pendingUpperTicket=0;
+   if(g_pendingLowerTicket!=0 && !lowerExists)
+      g_pendingLowerTicket=0;
 
-   if(g_pendingBuyStopTicket==0 && g_pendingSellStopTicket!=0 && sellExists)
+   if(g_pendingUpperTicket==0 && g_pendingLowerTicket!=0 && lowerExists)
      {
-      trade.OrderDelete(g_pendingSellStopTicket);
-      g_pendingSellStopTicket=0;
+      trade.OrderDelete(g_pendingLowerTicket);
+      g_pendingLowerTicket=0;
      }
-   else if(g_pendingSellStopTicket==0 && g_pendingBuyStopTicket!=0 && buyExists)
+   else if(g_pendingLowerTicket==0 && g_pendingUpperTicket!=0 && upperExists)
      {
-      trade.OrderDelete(g_pendingBuyStopTicket);
-      g_pendingBuyStopTicket=0;
+      trade.OrderDelete(g_pendingUpperTicket);
+      g_pendingUpperTicket=0;
      }
   }
 
+// Normal mode: Buy Stop at the prior high (follow an upward breakout), Sell Stop at
+// the prior low (follow a downward breakout). InpReverseSignal fades instead of
+// following - Sell Limit at the prior high, Buy Limit at the prior low - since a
+// stop order can't sit on the wrong side of price; only a limit order can fade a level.
 void PlaceBreakoutStops()
   {
    double prevHigh=iHigh(_Symbol,g_timeframe,1);
@@ -251,15 +258,20 @@ void PlaceBreakoutStops()
       return;
      }
 
-   double buyStopPrice =AdjustStopPrice(_Symbol,ORDER_TYPE_BUY_STOP, prevHigh+PipsToPrice(_Symbol,InpEntryBufferPips));
-   double sellStopPrice=AdjustStopPrice(_Symbol,ORDER_TYPE_SELL_STOP,prevLow -PipsToPrice(_Symbol,InpEntryBufferPips));
+   ENUM_ORDER_TYPE upperType=InpReverseSignal?ORDER_TYPE_SELL_LIMIT:ORDER_TYPE_BUY_STOP;
+   ENUM_ORDER_TYPE lowerType=InpReverseSignal?ORDER_TYPE_BUY_LIMIT :ORDER_TYPE_SELL_STOP;
+   bool upperIsBuy=!InpReverseSignal;
+   bool lowerIsBuy= InpReverseSignal;
+
+   double upperPrice=AdjustStopPrice(_Symbol,upperType,prevHigh+PipsToPrice(_Symbol,InpEntryBufferPips));
+   double lowerPrice=AdjustStopPrice(_Symbol,lowerType,prevLow -PipsToPrice(_Symbol,InpEntryBufferPips));
 
    double lot=InpUseRiskPercent
               ? CalcLotByRisk(_Symbol,InpRiskPercent,InpStopLossPips)
               : NormalizeVolume(_Symbol,InpLotSize);
 
    int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-   double buySl,buyTp,sellSl,sellTp;
+   double upperSl,upperTp,lowerSl,lowerTp;
 
    if(InpUseVirtualExits)
      {
@@ -267,17 +279,17 @@ void PlaceBreakoutStops()
       // wide real SL kept only as a crash/disconnect backstop - the tight virtual SL
       // below is what actually protects the trade under normal operation.
       double backstopPips=InpStopLossPips*InpBackstopSLMultiplier;
-      buySl =NormalizeDouble(buyStopPrice -PipsToPrice(_Symbol,backstopPips),digits);
-      buyTp =0.0;
-      sellSl=NormalizeDouble(sellStopPrice+PipsToPrice(_Symbol,backstopPips),digits);
-      sellTp=0.0;
+      upperSl=NormalizeDouble(upperIsBuy?upperPrice-PipsToPrice(_Symbol,backstopPips):upperPrice+PipsToPrice(_Symbol,backstopPips),digits);
+      upperTp=0.0;
+      lowerSl=NormalizeDouble(lowerIsBuy?lowerPrice-PipsToPrice(_Symbol,backstopPips):lowerPrice+PipsToPrice(_Symbol,backstopPips),digits);
+      lowerTp=0.0;
      }
    else
      {
-      buySl =NormalizeDouble(buyStopPrice -PipsToPrice(_Symbol,InpStopLossPips),  digits);
-      buyTp =NormalizeDouble(buyStopPrice +PipsToPrice(_Symbol,InpTakeProfitPips),digits);
-      sellSl=NormalizeDouble(sellStopPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
-      sellTp=NormalizeDouble(sellStopPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
+      upperSl=NormalizeDouble(upperIsBuy?upperPrice-PipsToPrice(_Symbol,InpStopLossPips)  :upperPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
+      upperTp=NormalizeDouble(upperIsBuy?upperPrice+PipsToPrice(_Symbol,InpTakeProfitPips):upperPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
+      lowerSl=NormalizeDouble(lowerIsBuy?lowerPrice-PipsToPrice(_Symbol,InpStopLossPips)  :lowerPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
+      lowerTp=NormalizeDouble(lowerIsBuy?lowerPrice+PipsToPrice(_Symbol,InpTakeProfitPips):lowerPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
      }
 
    ENUM_ORDER_TYPE_TIME typeTime=ORDER_TIME_GTC;
@@ -290,15 +302,15 @@ void PlaceBreakoutStops()
 
    string comment=StringFormat("BOS_%d",(int)g_lastBarTime);
 
-   if(trade.OrderOpen(_Symbol,ORDER_TYPE_BUY_STOP,lot,0.0,buyStopPrice,buySl,buyTp,typeTime,expiration,comment))
-      g_pendingBuyStopTicket=trade.ResultOrder();
+   if(trade.OrderOpen(_Symbol,upperType,lot,0.0,upperPrice,upperSl,upperTp,typeTime,expiration,comment))
+      g_pendingUpperTicket=trade.ResultOrder();
    else
-      Print("Buy stop failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(buyStopPrice,digits));
+      Print(EnumToString(upperType)," failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(upperPrice,digits));
 
-   if(trade.OrderOpen(_Symbol,ORDER_TYPE_SELL_STOP,lot,0.0,sellStopPrice,sellSl,sellTp,typeTime,expiration,comment))
-      g_pendingSellStopTicket=trade.ResultOrder();
+   if(trade.OrderOpen(_Symbol,lowerType,lot,0.0,lowerPrice,lowerSl,lowerTp,typeTime,expiration,comment))
+      g_pendingLowerTicket=trade.ResultOrder();
    else
-      Print("Sell stop failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(sellStopPrice,digits));
+      Print(EnumToString(lowerType)," failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(lowerPrice,digits));
   }
 
 void CloseDrawdownPositions()

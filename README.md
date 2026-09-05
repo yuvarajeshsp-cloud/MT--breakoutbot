@@ -55,6 +55,7 @@ current positions.
 | `InpBreakevenBufferPips` | 0.25 | Extra pips locked in beyond spread at breakeven |
 | `InpEntryBufferPips` | 0 | Offset added beyond the prior candle's high/low |
 | `InpPendingExpiryMinutes` | 0 | Pending order expiry; 0 = GTC (orders are replaced every bar regardless) |
+| `InpReverseSignal` | false | Fade the breakout instead of following it (see Reverse Signal Mode below) |
 | `InpUseRiskPercent` | false | Use risk-percent position sizing instead of a fixed lot |
 | `InpRiskPercent` | 1.0 | Risk per trade, % of account balance (if `InpUseRiskPercent`) |
 | `InpLotSize` | 0.01 | Fixed lot size (if not using risk-percent sizing) |
@@ -99,6 +100,30 @@ entry, SL, and TP lines together for **every** order/position on that chart,
 not just this EA's, and it's chart-wide rather than per-EA. The EA records
 whatever the setting was when it started and restores it on removal, so it
 won't permanently change your terminal's chart behavior.
+
+## Reverse Signal Mode
+
+`InpReverseSignal` fades the breakout instead of following it. A stop order
+can't sit on the wrong side of the current price, so this isn't a simple
+Buy↔Sell swap at the same levels — it switches order types entirely:
+
+- Normal mode: **Buy Stop** at the prior high (buy if price breaks above),
+  **Sell Stop** at the prior low (sell if price breaks below).
+- Reverse mode: **Sell Limit** at the prior high (sell if price rallies back
+  up to it, betting on rejection), **Buy Limit** at the prior low (buy if
+  price dips back down to it, betting on a bounce).
+
+Everything downstream — TP/SL/breakeven (virtual or broker-side), the
+drawdown-close rule, OCO enforcement, the dashboard — already operates on the
+resulting position's BUY/SELL type rather than how it was opened, so none of
+that needed to change; only order placement did.
+
+**Reversing a losing configuration is not a guaranteed fix.** Spread and
+slippage cost the same in both directions, and a breakout system that loses
+money isn't mathematically guaranteed to become a winning fade system when
+inverted — it depends on why it was losing. Backtest the reversed mode with
+the same rigor (realistic spread, a meaningful sample size, more than a few
+days) before trusting it any more than the original.
 
 ## Virtual Exit Management
 
