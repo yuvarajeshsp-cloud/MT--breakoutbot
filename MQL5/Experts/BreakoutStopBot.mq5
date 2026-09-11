@@ -1,5 +1,5 @@
 #property copyright "BreakoutStopBot"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 #property description "Candle breakout bot: places a Buy Stop / Sell Stop OCO pair at the prior "
 #property description "candle's high/low every bar, manages TP/SL/breakeven, closes drawdown "
