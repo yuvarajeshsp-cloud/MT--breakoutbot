@@ -53,6 +53,30 @@ double AdjustStopPrice(const string symbol,ENUM_ORDER_TYPE orderType,double pric
    return NormalizeDouble(price,digits);
   }
 
+// Clamps a pending limit price to respect the broker's minimum stop distance.
+// Unlike AdjustStopPrice, a limit order must sit on the near side of the market
+// (below Ask for a buy limit, above Bid for a sell limit), so the clamp direction
+// is the mirror image of AdjustStopPrice's.
+double AdjustLimitPrice(const string symbol,ENUM_ORDER_TYPE orderType,double price)
+  {
+   long stopsLevelPoints=SymbolInfoInteger(symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
+   double minDistance=stopsLevelPoints*point;
+   int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+
+   if(orderType==ORDER_TYPE_BUY_LIMIT)
+     {
+      double maxPrice=SymbolInfoDouble(symbol,SYMBOL_ASK)-minDistance;
+      if(price>maxPrice) price=maxPrice;
+     }
+   else if(orderType==ORDER_TYPE_SELL_LIMIT)
+     {
+      double minPrice=SymbolInfoDouble(symbol,SYMBOL_BID)+minDistance;
+      if(price<minPrice) price=minPrice;
+     }
+   return NormalizeDouble(price,digits);
+  }
+
 bool IsNewBar(const string symbol,ENUM_TIMEFRAMES timeframe,datetime &lastBarTime)
   {
    datetime currentBarTime=iTime(symbol,timeframe,0);

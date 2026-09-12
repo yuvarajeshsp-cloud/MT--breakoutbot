@@ -1,17 +1,18 @@
 #property copyright "BreakoutStopBot"
-#property version   "2.00"
+#property version   "3.00"
 #property strict
-#property description "Candle breakout bot: places a Buy Stop / Sell Stop OCO pair at the prior "
-#property description "candle's high/low every bar, manages TP/SL/breakeven, closes drawdown "
-#property description "positions at candle close, and flattens everything once a day."
+#property description "Sideways-range breakout bot: locks a consolidation range, waits for a "
+#property description "full-body breakout, enters on retracement into a fair value gap (or a "
+#property description "breaker block if no gap formed), stops at the far side of the range, "
+#property description "takes a partial at 1:1, and trails the remainder past 2:1."
 
 #include <Trade/Trade.mqh>
 #include "../Include/BreakoutStopBot/TradeUtils.mqh"
 #include "../Include/BreakoutStopBot/RiskManager.mqh"
 #include "../Include/BreakoutStopBot/Dashboard.mqh"
 
-// Capped at M1/M3/M5 - this is a short-timeframe breakout system and isn't
-// intended (or validated) for slower candles.
+// Capped at M1/M3/M5 - this is a short-timeframe system and isn't intended
+// (or validated) for slower candles.
 enum ENUM_BOT_TIMEFRAME
   {
    BOT_PERIOD_M1=PERIOD_M1,
@@ -19,133 +20,177 @@ enum ENUM_BOT_TIMEFRAME
    BOT_PERIOD_M5=PERIOD_M5
   };
 
-// How CloseDrawdownPositions decides a losing position should be cut early,
-// rather than left to run to its real SL. ANY_LOSS (the original behavior)
-// closes on any floating loss at all, however small - since a fresh position
-// is valued at the opposite side of the spread from where it entered, this
-// can realize a small loss on spread noise alone before a trade has any real
-// chance to develop. The other three modes require an actual adverse move.
-enum ENUM_DRAWDOWN_CLOSE_MODE
+// One full range->breakout->retracement->trade cycle runs at a time; the bot only
+// ever occupies one of these states.
+enum ENUM_BOT_STATE
   {
-   DRAWDOWN_CLOSE_ANY_LOSS,       // Close on any floating loss at all (original behavior)
-   DRAWDOWN_CLOSE_MIN_THRESHOLD,  // Close only once the loss exceeds InpDrawdownMinLossPips
-   DRAWDOWN_CLOSE_WAIT_CANDLES,   // Close only if still negative after InpDrawdownGraceCandles closes
-   DRAWDOWN_CLOSE_PERCENT_OF_SL   // Close once the loss reaches InpDrawdownPercentOfSL % of InpStopLossPips
+   STATE_SCANNING,       // hunting for a sideways range
+   STATE_RANGE_LOCKED,   // range frozen, waiting for a full-body breakout
+   STATE_PENDING_ENTRY,  // breakout confirmed, retracement limit order resting
+   STATE_IN_TRADE        // position filled, under 1R/2R management
+  };
+
+enum ENUM_BREAKOUT_DIR
+  {
+   BREAKOUT_NONE,
+   BREAKOUT_BULLISH,
+   BREAKOUT_BEARISH
   };
 
 input group "=== Timeframe ==="
-input ENUM_BOT_TIMEFRAME InpTimeframe = BOT_PERIOD_M1;  // Candle timeframe (M1/M3/M5 only)
+input ENUM_BOT_TIMEFRAME InpTimeframe        = BOT_PERIOD_M1;  // Candle timeframe (M1/M3/M5 only)
 
-input group "=== Take Profit / Stop Loss ==="
-input double InpTakeProfitPips         = 100.0;  // Take profit distance (pips)
-input double InpStopLossPips           = 50.0;   // Stop loss distance (pips)
+input group "=== Range Detection ==="
+input int    InpRangeLookbackBars    = 20;    // Bars used to measure the sideways range
+input int    InpATRPeriod            = 14;    // ATR period used to judge range compression
+input double InpRangeMaxATRMult      = 1.5;   // Range height must be <= this x ATR to qualify as sideways
+input int    InpRangeMinConfirmBars  = 3;     // Consecutive sideways-qualifying candles required before locking
+input int    InpRangeMaxAgeBars      = 0;     // Give up and re-scan if no breakout within this many bars; 0 = never expires
+
+input group "=== Breakout Confirmation ==="
+input double InpMinBreakoutBodyPips  = 0.0;   // Minimum candle body size to count as a breakout; 0 = disabled
+
+input group "=== Retracement Zone ==="
+input double InpEntryZonePct         = 50.0;  // Where in the FVG/breaker zone to enter: 0=near edge, 50=mid, 100=far edge
+input int    InpRetracementTimeoutBars = 10;  // Cancel the pending retracement order if not filled within this many bars
+
+input group "=== Stop Loss ==="
+input double InpSlBufferPips         = 2.0;   // Extra buffer beyond the opposite side of the range
 
 input group "=== Breakeven ==="
-input double InpBreakevenTriggerPips   = 20.0;   // Floating profit (pips) needed before breakeven arms
-input double InpBreakevenBufferPips    = 0.25;   // Extra pips locked in beyond spread at breakeven
-input double InpLatencyBufferPips      = 1.0;    // Extra pips added to the breakeven lock to survive round-trip order latency
+input double InpBreakevenBufferPips  = 0.25;  // Extra pips locked in beyond spread at breakeven
+input double InpLatencyBufferPips    = 1.0;   // Extra pips added to the breakeven lock to survive round-trip order latency
 
-input group "=== Entry ==="
-input double InpEntryBufferPips        = 0.0;    // Offset beyond prior candle's high/low
-input int    InpPendingExpiryMinutes   = 0;      // 0 = GTC (orders are replaced every bar regardless)
+input group "=== Trade Management ==="
+input double InpPartialClosePercent  = 50.0;  // % of position closed once profit reaches 1R
+input double InpTrailStepPips        = 15.0;  // Trailing distance kept behind price once profit passes 2R
 
 input group "=== Position Sizing ==="
-input bool   InpUseRiskPercent         = false;  // Use risk-percent sizing instead of fixed lot
-input double InpRiskPercent            = 1.0;    // Risk per trade, % of balance (if InpUseRiskPercent)
-input double InpLotSize                = 0.01;   // Fixed lot size (if !InpUseRiskPercent)
+input bool   InpUseRiskPercent       = false; // Use risk-percent sizing instead of fixed lot
+input double InpRiskPercent          = 1.0;   // Risk per trade, % of balance (if InpUseRiskPercent)
+input double InpLotSize              = 0.01;  // Fixed lot size (if !InpUseRiskPercent)
 
 input group "=== Risk Controls ==="
-input int    InpMaxConcurrentPositions = 3;      // Max simultaneously open positions from this EA
-input double InpMaxSpreadPips          = 3.0;    // Skip placing new stops if spread exceeds this; 0 = disabled
-
-input group "=== Drawdown Close ==="
-input ENUM_DRAWDOWN_CLOSE_MODE InpDrawdownCloseMode = DRAWDOWN_CLOSE_MIN_THRESHOLD; // How to decide when to close a losing position early
-input double InpDrawdownMinLossPips    = 3.0;    // (Min Threshold mode) Close only once loss exceeds this many pips
-input int    InpDrawdownGraceCandles   = 2;      // (Wait N Candles mode) Consecutive negative closes allowed before closing
-input double InpDrawdownPercentOfSL    = 50.0;   // (Percent of SL mode) Close once loss reaches this % of InpStopLossPips
+input int    InpMaxConcurrentPositions = 1;   // Max simultaneously open positions from this EA
+input double InpMaxSpreadPips        = 3.0;   // Skip placing the retracement order if spread exceeds this; 0 = disabled
 
 input group "=== Session Filter ==="
-input bool   InpUseSessionFilter       = false;  // Restrict new stop placement to a time window
-input int    InpTradingStartHour       = 0;      // Server-time hour, inclusive
-input int    InpTradingEndHour         = 24;     // Server-time hour, exclusive
+input bool   InpUseSessionFilter     = false; // Restrict new retracement orders to a time window
+input int    InpTradingStartHour     = 0;     // Server-time hour, inclusive
+input int    InpTradingEndHour       = 24;    // Server-time hour, exclusive
 
 input group "=== Volume Filter ==="
-input bool   InpUseVolumeFilter        = true;   // Only place new stops when the candle's tick volume is above the recent average
-input int    InpVolumeLookbackBars     = 20;     // Number of prior candles averaged for comparison
-input double InpMinVolumeRatio         = 1.0;    // Required ratio: candle volume >= this x average volume
+input bool   InpUseVolumeFilter      = true;  // Only accept a breakout candle if its volume is above the recent average
+input int    InpVolumeLookbackBars   = 20;    // Number of prior candles averaged for comparison
+input double InpMinVolumeRatio       = 1.0;   // Required ratio: breakout candle volume >= this x average volume
 
 input group "=== Execution ==="
-input int    InpSlippagePips           = 2;      // Max slippage for market operations (pips)
-input ulong  InpMagicNumber            = 20260904;
-input bool   InpCancelPendingOnRemove  = true;   // Cancel our pending stops when the EA is removed
+input int    InpSlippagePips         = 2;     // Max slippage for market operations (pips)
+input ulong  InpMagicNumber          = 20260904;
+input bool   InpCancelPendingOnRemove = true; // Cancel our pending retracement order when the EA is removed
 
 input group "=== Dashboard ==="
-input bool   InpShowDashboard          = true;   // Show on-chart P/L dashboard
-input int    InpDashboardRefreshSeconds= 5;      // How often the dashboard recalculates
+input bool   InpShowDashboard        = true;  // Show on-chart P/L dashboard
+input int    InpDashboardRefreshSeconds= 5;   // How often the dashboard recalculates
 
 input group "=== Daily Flatten ==="
-input bool   InpUseDailyFlatten        = true;   // Close all positions and cancel all pending orders once per day
-input int    InpDailyFlattenHour       = 0;      // Server-time hour to flatten (0 = midnight)
+input bool   InpUseDailyFlatten      = true;  // Close all positions and cancel pending orders once per day
+input int    InpDailyFlattenHour     = 0;     // Server-time hour to flatten (0 = midnight)
 
 CTrade           trade;
-ENUM_TIMEFRAMES  g_timeframe            = PERIOD_M1;
-datetime         g_lastBarTime          = 0;
-ulong            g_pendingBuyStopTicket = 0;
-ulong            g_pendingSellStopTicket= 0;
-int              g_lastFlattenDay       = -1;
+ENUM_TIMEFRAMES  g_timeframe        = PERIOD_M1;
+datetime         g_lastBarTime      = 0;
+int              g_lastFlattenDay   = -1;
+int              g_atrHandle        = INVALID_HANDLE;
+ENUM_BOT_STATE   g_state            = STATE_SCANNING;
 
-// Consecutive-negative-candle-close counter per position, used only by
-// DRAWDOWN_CLOSE_WAIT_CANDLES mode - resets to 0 the moment a position is no
-// longer negative at a candle close, since "still negative" must be an
-// unbroken streak, not just N negative closes at any point in its life.
-struct DrawdownStreak
+// --- Range/cycle state (valid once g_state != STATE_SCANNING) ---
+double   g_boxHigh          = 0.0;
+double   g_boxLow           = 0.0;
+datetime g_boxStartTime     = 0;
+int      g_sidewaysConfirmCount = 0;
+int      g_barsSinceLock    = 0;
+
+// --- Pending-entry state (valid once g_state == STATE_PENDING_ENTRY) ---
+ulong    g_pendingEntryTicket = 0;
+int      g_plannedDirection   = 0;   // 1=buy, -1=sell
+double   g_plannedInitialSl   = 0.0;
+int      g_barsWaitingForFill = 0;
+string   g_cycleComment       = "";
+
+// Per-position management state once a retracement order fills. Mirrors the
+// ticket-keyed struct-array pattern used elsewhere in this file (see the
+// removed DrawdownStreak tracker in git history) - here tracking each
+// position's frozen R distance and how far its exit has progressed.
+struct PositionMgmt
   {
-   ulong ticket;
-   int   negativeCloses;
+   ulong  ticket;
+   double entryPrice;
+   double initialSl;       // frozen R reference, fixed at fill, never changes
+   int    direction;       // 1=buy, -1=sell
+   double rPips;           // |entryPrice-initialSl| in pips, computed once
+   bool   partialDone;
+   double currentSl;       // current committed protective SL, ratchets only
+   bool   trailingActive;
   };
-DrawdownStreak g_drawdownStreaks[];
+PositionMgmt g_positionMgmt[];
 
-int FindDrawdownStreak(ulong ticket)
+int FindPositionMgmt(ulong ticket)
   {
-   for(int i=0;i<ArraySize(g_drawdownStreaks);i++)
-      if(g_drawdownStreaks[i].ticket==ticket)
+   for(int i=0;i<ArraySize(g_positionMgmt);i++)
+      if(g_positionMgmt[i].ticket==ticket)
          return i;
    return -1;
   }
 
-int IncrementDrawdownStreak(ulong ticket)
+void InitPositionMgmt(ulong ticket,int direction)
   {
-   int idx=FindDrawdownStreak(ticket);
-   if(idx<0)
-     {
-      idx=ArraySize(g_drawdownStreaks);
-      ArrayResize(g_drawdownStreaks,idx+1);
-      g_drawdownStreaks[idx].ticket=ticket;
-      g_drawdownStreaks[idx].negativeCloses=0;
-     }
-   g_drawdownStreaks[idx].negativeCloses++;
-   return g_drawdownStreaks[idx].negativeCloses;
+   if(!PositionSelectByTicket(ticket)) return;
+   double entry=PositionGetDouble(POSITION_PRICE_OPEN);
+   int idx=ArraySize(g_positionMgmt);
+   ArrayResize(g_positionMgmt,idx+1);
+   g_positionMgmt[idx].ticket=ticket;
+   g_positionMgmt[idx].entryPrice=entry;
+   g_positionMgmt[idx].initialSl=g_plannedInitialSl;
+   g_positionMgmt[idx].direction=direction;
+   g_positionMgmt[idx].rPips=PriceToPips(_Symbol,MathAbs(entry-g_plannedInitialSl));
+   g_positionMgmt[idx].partialDone=false;
+   g_positionMgmt[idx].currentSl=g_plannedInitialSl;
+   g_positionMgmt[idx].trailingActive=false;
   }
 
-void ResetDrawdownStreak(ulong ticket)
-  {
-   int idx=FindDrawdownStreak(ticket);
-   if(idx>=0)
-      g_drawdownStreaks[idx].negativeCloses=0;
-  }
-
-void PruneDrawdownStreaks(const string symbol,ulong magic)
+void PrunePositionMgmt(const string symbol,ulong magic)
   {
    ulong openTickets[];
    int openCount=GetPositionTickets(symbol,magic,openTickets);
-   for(int i=ArraySize(g_drawdownStreaks)-1;i>=0;i--)
+   for(int i=ArraySize(g_positionMgmt)-1;i>=0;i--)
      {
       bool stillOpen=false;
       for(int j=0;j<openCount;j++)
-         if(openTickets[j]==g_drawdownStreaks[i].ticket) { stillOpen=true; break; }
+         if(openTickets[j]==g_positionMgmt[i].ticket) { stillOpen=true; break; }
       if(!stillOpen)
-         ArrayRemove(g_drawdownStreaks,i,1);
+         ArrayRemove(g_positionMgmt,i,1);
      }
+  }
+
+// Clears all cycle/pending-entry/position-management state and returns to scanning.
+// Does not touch open positions or orders - callers that need those cancelled/closed
+// do so before calling this.
+void ResetCycle()
+  {
+   g_boxHigh=0.0; g_boxLow=0.0; g_boxStartTime=0;
+   g_sidewaysConfirmCount=0; g_barsSinceLock=0;
+   g_pendingEntryTicket=0; g_plannedDirection=0; g_plannedInitialSl=0.0;
+   g_barsWaitingForFill=0; g_cycleComment="";
+   ArrayResize(g_positionMgmt,0);
+   g_state=STATE_SCANNING;
+  }
+
+void CancelPendingEntry()
+  {
+   if(g_pendingEntryTicket!=0 && OrderSelect(g_pendingEntryTicket))
+      trade.OrderDelete(g_pendingEntryTicket);
+   g_pendingEntryTicket=0;
   }
 
 int OnInit()
@@ -170,13 +215,24 @@ int OnInit()
             TimeframeLabel(g_timeframe)," candle data internally regardless of chart period, but "
             "run it on a matching chart for accurate new-bar timing.");
 
+   g_atrHandle=iATR(_Symbol,g_timeframe,InpATRPeriod);
+   if(g_atrHandle==INVALID_HANDLE)
+     {
+      Print("Failed to create ATR indicator handle, error=",GetLastError());
+      return(INIT_FAILED);
+     }
+
    g_lastBarTime=iTime(_Symbol,g_timeframe,0);
+   g_state=STATE_SCANNING;
 
    Print("BreakoutStopBot init: timeframe=",TimeframeLabel(g_timeframe),
-         " TP=",DoubleToString(InpTakeProfitPips,1),"pips SL=",DoubleToString(InpStopLossPips,1),"pips",
-         " breakevenTrigger=",DoubleToString(InpBreakevenTriggerPips,1),"pips",
-         " latencyBuffer=",DoubleToString(InpLatencyBufferPips,1),"pips",
-         " drawdownCloseMode=",EnumToString(InpDrawdownCloseMode),
+         " rangeLookback=",InpRangeLookbackBars,"bars atrPeriod=",InpATRPeriod,
+         " rangeMaxATRMult=",DoubleToString(InpRangeMaxATRMult,2),
+         " confirmBars=",InpRangeMinConfirmBars,
+         " entryZonePct=",DoubleToString(InpEntryZonePct,1),
+         " slBuffer=",DoubleToString(InpSlBufferPips,1),"pips",
+         " partialClose=",DoubleToString(InpPartialClosePercent,1),"% at 1R",
+         " trailStep=",DoubleToString(InpTrailStepPips,1),"pips past 2R",
          " volumeFilter=",InpUseVolumeFilter,"(",InpVolumeLookbackBars,"bars,>=",DoubleToString(InpMinVolumeRatio,2),"x)",
          " sessionFilter=",InpUseSessionFilter,
          " dailyFlatten=",InpUseDailyFlatten,"(hour ",InpDailyFlattenHour,")");
@@ -196,13 +252,11 @@ void OnDeinit(const int reason)
    EventKillTimer();
    RemoveDashboard();
 
+   if(g_atrHandle!=INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
+
    if(InpCancelPendingOnRemove && reason==REASON_REMOVE)
-     {
-      if(g_pendingBuyStopTicket!=0 && OrderSelect(g_pendingBuyStopTicket))
-         trade.OrderDelete(g_pendingBuyStopTicket);
-      if(g_pendingSellStopTicket!=0 && OrderSelect(g_pendingSellStopTicket))
-         trade.OrderDelete(g_pendingSellStopTicket);
-     }
+      CancelPendingEntry();
   }
 
 void OnTimer()
@@ -215,8 +269,14 @@ void OnTick()
   {
    CheckDailyFlatten();
 
-   EnforceOco();
-   ManageBreakeven();
+   if(g_state==STATE_PENDING_ENTRY)
+      CheckPendingEntryFill();
+
+   if(g_state==STATE_IN_TRADE)
+     {
+      ManageTradeLifecycle();
+      CheckCycleCompletion();
+     }
 
    if(IsNewBar(_Symbol,g_timeframe,g_lastBarTime))
       OnNewBar();
@@ -224,243 +284,464 @@ void OnTick()
 
 void OnNewBar()
   {
-   CloseDrawdownPositions();
-   CancelStalePendingOrders();
-
    if(InpShowDashboard)
       UpdateDashboard(_Symbol,InpMagicNumber,g_timeframe);
 
-   if(!SpreadOk())
+   switch(g_state)
      {
-      Print("Spread ",DoubleToString(CurrentSpreadPips(_Symbol),1)," pips exceeds max ",
-            DoubleToString(InpMaxSpreadPips,1),", skipping new stop orders this bar.");
+      case STATE_SCANNING:
+         EvaluateRangeDetection();
+         break;
+      case STATE_RANGE_LOCKED:
+         ProcessRangeLocked();
+         break;
+      case STATE_PENDING_ENTRY:
+         ProcessPendingEntry();
+         break;
+      case STATE_IN_TRADE:
+         ManageTrailingStep();
+         break;
+     }
+  }
+
+//=== Range detection (SCANNING -> RANGE_LOCKED) =============================
+
+// Sideways = the last InpRangeLookbackBars closed candles' high-low span is no
+// more than InpRangeMaxATRMult x ATR, held for InpRangeMinConfirmBars consecutive
+// closed candles in a row (any failing candle resets the streak). Only runs while
+// scanning, and locking the box leaves STATE_SCANNING entirely, so an accepted
+// range is never re-measured or shifted mid-cycle.
+void EvaluateRangeDetection()
+  {
+   double atrBuf[];
+   if(CopyBuffer(g_atrHandle,0,1,1,atrBuf)<=0)
+      return;
+   double atrPips=PriceToPips(_Symbol,atrBuf[0]);
+   if(atrPips<=0.0)
+      return;
+
+   double boxHigh=iHigh(_Symbol,g_timeframe,1);
+   double boxLow =iLow(_Symbol,g_timeframe,1);
+   for(int s=2;s<=InpRangeLookbackBars;s++)
+     {
+      boxHigh=MathMax(boxHigh,iHigh(_Symbol,g_timeframe,s));
+      boxLow =MathMin(boxLow, iLow(_Symbol,g_timeframe,s));
+     }
+   double rangePips=PriceToPips(_Symbol,boxHigh-boxLow);
+   bool sideways=(rangePips<=InpRangeMaxATRMult*atrPips);
+
+   if(!sideways)
+     {
+      g_sidewaysConfirmCount=0;
+      return;
+     }
+
+   g_sidewaysConfirmCount++;
+   if(g_sidewaysConfirmCount<InpRangeMinConfirmBars)
+      return;
+
+   g_boxHigh=boxHigh;
+   g_boxLow=boxLow;
+   g_boxStartTime=iTime(_Symbol,g_timeframe,InpRangeLookbackBars);
+   g_barsSinceLock=0;
+   g_sidewaysConfirmCount=0;
+   g_state=STATE_RANGE_LOCKED;
+
+   Print("Range locked: high=",DoubleToString(boxHigh,_Digits)," low=",DoubleToString(boxLow,_Digits),
+         " (",DoubleToString(rangePips,1)," pips <= ",DoubleToString(InpRangeMaxATRMult*atrPips,1)," ATR-pips)");
+  }
+
+//=== Breakout confirmation + retracement setup (RANGE_LOCKED) ===============
+
+ENUM_BREAKOUT_DIR DetectBreakout(double boxHigh,double boxLow,double minBodyPips)
+  {
+   double o=iOpen(_Symbol,g_timeframe,1);
+   double c=iClose(_Symbol,g_timeframe,1);
+   double bodyLow=MathMin(o,c);
+   double bodyHigh=MathMax(o,c);
+
+   if(minBodyPips>0.0 && PriceToPips(_Symbol,MathAbs(c-o))<minBodyPips)
+      return BREAKOUT_NONE;
+
+   if(bodyLow>=boxHigh) return BREAKOUT_BULLISH;
+   if(bodyHigh<=boxLow) return BREAKOUT_BEARISH;
+   return BREAKOUT_NONE;
+  }
+
+struct SZone
+  {
+   double zoneHigh;
+   double zoneLow;
+   int    direction;   // 1=bullish, -1=bearish
+  };
+
+// Bullish FVG: candle[s].low > candle[s+2].high (gap = [candle[s+2].high, candle[s].low]).
+// Bearish FVG: candle[s].high < candle[s+2].low (gap = [candle[s].high, candle[s+2].low]).
+// Scans s from the breakout candle backward to the range start so the match nearest
+// the breakout wins; the breakout candle itself may be the newest leg of the triple.
+bool FindFVGZone(int breakoutShift,int boxStartShift,int direction,SZone &zone)
+  {
+   for(int s=breakoutShift;s<=boxStartShift-2;s++)
+     {
+      double highOldest=iHigh(_Symbol,g_timeframe,s+2);
+      double lowOldest =iLow(_Symbol,g_timeframe,s+2);
+      double highNewest=iHigh(_Symbol,g_timeframe,s);
+      double lowNewest =iLow(_Symbol,g_timeframe,s);
+
+      if(direction==1 && lowNewest>highOldest)
+        {
+         zone.zoneLow=highOldest; zone.zoneHigh=lowNewest; zone.direction=1;
+         return true;
+        }
+      if(direction==-1 && highNewest<lowOldest)
+        {
+         zone.zoneHigh=lowOldest; zone.zoneLow=highNewest; zone.direction=-1;
+         return true;
+        }
+     }
+   return false;
+  }
+
+// Breaker block fallback: the nearest candle (scanning backward from just before
+// the breakout candle) whose close is opposite the breakout direction. Its full
+// high-low range is the zone.
+bool FindBreakerZone(int breakoutShift,int boxStartShift,int direction,SZone &zone)
+  {
+   for(int s=breakoutShift+1;s<=boxStartShift;s++)
+     {
+      double o=iOpen(_Symbol,g_timeframe,s);
+      double c=iClose(_Symbol,g_timeframe,s);
+      if(direction==1 && c<o)
+        {
+         zone.zoneHigh=iHigh(_Symbol,g_timeframe,s);
+         zone.zoneLow =iLow(_Symbol,g_timeframe,s);
+         zone.direction=1;
+         return true;
+        }
+      if(direction==-1 && c>o)
+        {
+         zone.zoneHigh=iHigh(_Symbol,g_timeframe,s);
+         zone.zoneLow =iLow(_Symbol,g_timeframe,s);
+         zone.direction=-1;
+         return true;
+        }
+     }
+   return false;
+  }
+
+bool BuildRetracementZone(int breakoutShift,int boxStartShift,int direction,SZone &zone)
+  {
+   if(FindFVGZone(breakoutShift,boxStartShift,direction,zone))
+      return true;
+   return FindBreakerZone(breakoutShift,boxStartShift,direction,zone);
+  }
+
+// entryZonePct is direction-aware: a bullish retrace reaches the zone's high edge
+// first (0% = zoneHigh, near/shallow) then works down toward zoneLow (100%, far/deep);
+// mirrored for bearish.
+double ComputeEntryPrice(const SZone &zone,double entryZonePct)
+  {
+   double pct=MathMax(0.0,MathMin(100.0,entryZonePct))/100.0;
+   double height=zone.zoneHigh-zone.zoneLow;
+   if(zone.direction==1)
+      return zone.zoneHigh-pct*height;
+   return zone.zoneLow+pct*height;
+  }
+
+bool PlaceRetracementOrder(const SZone &zone,int direction)
+  {
+   if(CountPositionsByMagic(_Symbol,InpMagicNumber)>=InpMaxConcurrentPositions)
+     {
+      Print("Max concurrent positions reached, skipping retracement order.");
+      return false;
+     }
+
+   double entryRaw=ComputeEntryPrice(zone,InpEntryZonePct);
+   double slRaw=(direction==1)
+                ? g_boxLow -PipsToPrice(_Symbol,InpSlBufferPips)
+                : g_boxHigh+PipsToPrice(_Symbol,InpSlBufferPips);
+
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   ENUM_ORDER_TYPE orderType=(direction==1)?ORDER_TYPE_BUY_LIMIT:ORDER_TYPE_SELL_LIMIT;
+
+   // Price already retraced through (or past) the planned entry before we could
+   // place the order - don't chase it into the middle of the move.
+   if(direction==1  && entryRaw>=ask) { Print("Zone already breached (bullish), skipping."); return false; }
+   if(direction==-1 && entryRaw<=bid) { Print("Zone already breached (bearish), skipping."); return false; }
+
+   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   double entryPrice=AdjustLimitPrice(_Symbol,orderType,entryRaw);
+   double slPrice=NormalizeDouble(slRaw,digits);
+   double slPips=PriceToPips(_Symbol,MathAbs(entryPrice-slPrice));
+   if(slPips<=0.0)
+     {
+      Print("Computed zero/negative SL distance, skipping retracement order.");
+      return false;
+     }
+
+   double lot=InpUseRiskPercent
+              ? CalcLotByRisk(_Symbol,InpRiskPercent,slPips)
+              : NormalizeVolume(_Symbol,InpLotSize);
+
+   g_cycleComment=StringFormat("BOSR_%d",(int)g_boxStartTime);
+
+   if(trade.OrderOpen(_Symbol,orderType,lot,0.0,entryPrice,slPrice,0.0,ORDER_TIME_GTC,0,g_cycleComment))
+     {
+      g_pendingEntryTicket=trade.ResultOrder();
+      g_plannedInitialSl=slPrice;
+      g_plannedDirection=direction;
+      Print("Retracement order placed: ",EnumToString(orderType),
+            " price=",DoubleToString(entryPrice,digits)," sl=",DoubleToString(slPrice,digits),
+            " lot=",DoubleToString(lot,2));
+      return true;
+     }
+
+   Print("Retracement order failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(entryPrice,digits));
+   return false;
+  }
+
+void ProcessRangeLocked()
+  {
+   g_barsSinceLock++;
+   if(InpRangeMaxAgeBars>0 && g_barsSinceLock>InpRangeMaxAgeBars)
+     {
+      Print("Range expired without breakout, resuming scan.");
+      ResetCycle();
+      return;
+     }
+
+   ENUM_BREAKOUT_DIR dir=DetectBreakout(g_boxHigh,g_boxLow,InpMinBreakoutBodyPips);
+   if(dir==BREAKOUT_NONE)
+      return; // keep watching, box stays valid
+
+   if(InpUseVolumeFilter && !VolumeOk())
+     {
+      Print("Breakout candle volume below the ",InpVolumeLookbackBars,"-bar average, waiting for a better breakout.");
+      return; // keep watching, box stays valid
+     }
+
+   int direction=(dir==BREAKOUT_BULLISH)?1:-1;
+   int boxStartShift=iBarShift(_Symbol,g_timeframe,g_boxStartTime,false);
+
+   SZone zone;
+   if(!BuildRetracementZone(1,boxStartShift,direction,zone))
+     {
+      Print("No FVG or breaker zone found for this breakout, discarding range.");
+      ResetCycle();
       return;
      }
 
    if(InpUseSessionFilter && !WithinSession())
-      return;
-
-   if(!VolumeOk())
      {
-      Print("Candle volume below ",DoubleToString(InpMinVolumeRatio,2),"x the ",InpVolumeLookbackBars,
-            "-bar average, skipping new stop orders this bar.");
+      Print("Breakout outside session window, discarding range.");
+      ResetCycle();
       return;
      }
 
-   int openCount=CountPositionsByMagic(_Symbol,InpMagicNumber);
-   if(openCount>=InpMaxConcurrentPositions)
+   if(!SpreadOk())
      {
-      Print("Max concurrent positions reached (",openCount,"/",InpMaxConcurrentPositions,
-            "), skipping new stop orders.");
+      Print("Spread ",DoubleToString(CurrentSpreadPips(_Symbol),1)," pips exceeds max ",
+            DoubleToString(InpMaxSpreadPips,1)," at breakout, discarding range.");
+      ResetCycle();
       return;
      }
 
-   PlaceBreakoutStops();
+   if(!PlaceRetracementOrder(zone,direction))
+     {
+      ResetCycle();
+      return;
+     }
+
+   g_barsWaitingForFill=0;
+   g_state=STATE_PENDING_ENTRY;
   }
 
-// Cancels the previous bar's OCO pair if it never filled, so stale breakout levels
-// don't accumulate. Positions already open are left untouched.
-void CancelStalePendingOrders()
-  {
-   if(g_pendingBuyStopTicket!=0)
-     {
-      if(OrderSelect(g_pendingBuyStopTicket))
-         trade.OrderDelete(g_pendingBuyStopTicket);
-      g_pendingBuyStopTicket=0;
-     }
-   if(g_pendingSellStopTicket!=0)
-     {
-      if(OrderSelect(g_pendingSellStopTicket))
-         trade.OrderDelete(g_pendingSellStopTicket);
-      g_pendingSellStopTicket=0;
-     }
-  }
+//=== Pending retracement order (PENDING_ENTRY) ==============================
 
-// If one side of the current OCO pair filled or vanished and the other is still
-// pending, cancel the sibling so only one direction can be active at a time.
-void EnforceOco()
+void ProcessPendingEntry()
   {
-   if(g_pendingBuyStopTicket==0 && g_pendingSellStopTicket==0)
+   g_barsWaitingForFill++;
+   if(InpRetracementTimeoutBars>0 && g_barsWaitingForFill>=InpRetracementTimeoutBars)
+     {
+      Print("Retracement order timed out without a fill, cancelling.");
+      CancelPendingEntry();
+      ResetCycle();
       return;
-
-   bool buyExists =g_pendingBuyStopTicket!=0  && OrderSelect(g_pendingBuyStopTicket);
-   bool sellExists=g_pendingSellStopTicket!=0 && OrderSelect(g_pendingSellStopTicket);
-
-   if(g_pendingBuyStopTicket!=0 && !buyExists)
-      g_pendingBuyStopTicket=0;
-   if(g_pendingSellStopTicket!=0 && !sellExists)
-      g_pendingSellStopTicket=0;
-
-   if(g_pendingBuyStopTicket==0 && g_pendingSellStopTicket!=0 && sellExists)
-     {
-      trade.OrderDelete(g_pendingSellStopTicket);
-      g_pendingSellStopTicket=0;
      }
-   else if(g_pendingSellStopTicket==0 && g_pendingBuyStopTicket!=0 && buyExists)
+
+   double close1=iClose(_Symbol,g_timeframe,1);
+   bool invalidated=(g_plannedDirection==1) ? (close1<g_boxLow) : (close1>g_boxHigh);
+   if(invalidated)
      {
-      trade.OrderDelete(g_pendingBuyStopTicket);
-      g_pendingBuyStopTicket=0;
+      Print("Breakout thesis invalidated (closed back through the opposite side), cancelling.");
+      CancelPendingEntry();
+      ResetCycle();
      }
   }
 
-void PlaceBreakoutStops()
+// Runs every tick while PENDING_ENTRY. MT5 doesn't guarantee the filled position's
+// ticket equals the pending order's ticket, so the fill is identified by matching
+// this cycle's comment tag on a position that isn't already tracked.
+void CheckPendingEntryFill()
   {
-   double prevHigh=iHigh(_Symbol,g_timeframe,1);
-   double prevLow =iLow(_Symbol,g_timeframe,1);
-   if(prevHigh<=0.0 || prevLow<=0.0)
-     {
-      Print("Invalid previous candle data, skipping stop placement.");
+   if(g_pendingEntryTicket==0)
       return;
-     }
+   if(OrderSelect(g_pendingEntryTicket))
+      return; // still resting
 
-   double buyStopPrice =AdjustStopPrice(_Symbol,ORDER_TYPE_BUY_STOP, prevHigh+PipsToPrice(_Symbol,InpEntryBufferPips));
-   double sellStopPrice=AdjustStopPrice(_Symbol,ORDER_TYPE_SELL_STOP,prevLow -PipsToPrice(_Symbol,InpEntryBufferPips));
-
-   double lot=InpUseRiskPercent
-              ? CalcLotByRisk(_Symbol,InpRiskPercent,InpStopLossPips)
-              : NormalizeVolume(_Symbol,InpLotSize);
-
-   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-   double buySl =NormalizeDouble(buyStopPrice -PipsToPrice(_Symbol,InpStopLossPips),  digits);
-   double buyTp =NormalizeDouble(buyStopPrice +PipsToPrice(_Symbol,InpTakeProfitPips),digits);
-   double sellSl=NormalizeDouble(sellStopPrice+PipsToPrice(_Symbol,InpStopLossPips),  digits);
-   double sellTp=NormalizeDouble(sellStopPrice-PipsToPrice(_Symbol,InpTakeProfitPips),digits);
-
-   ENUM_ORDER_TYPE_TIME typeTime=ORDER_TIME_GTC;
-   datetime expiration=0;
-   if(InpPendingExpiryMinutes>0)
-     {
-      typeTime=ORDER_TIME_SPECIFIED;
-      expiration=TimeCurrent()+InpPendingExpiryMinutes*60;
-     }
-
-   string comment=StringFormat("BOS_%d",(int)g_lastBarTime);
-
-   if(trade.OrderOpen(_Symbol,ORDER_TYPE_BUY_STOP,lot,0.0,buyStopPrice,buySl,buyTp,typeTime,expiration,comment))
-      g_pendingBuyStopTicket=trade.ResultOrder();
-   else
-      Print("Buy stop failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(buyStopPrice,digits));
-
-   if(trade.OrderOpen(_Symbol,ORDER_TYPE_SELL_STOP,lot,0.0,sellStopPrice,sellSl,sellTp,typeTime,expiration,comment))
-      g_pendingSellStopTicket=trade.ResultOrder();
-   else
-      Print("Sell stop failed: ",trade.ResultRetcodeDescription()," price=",DoubleToString(sellStopPrice,digits));
-  }
-
-void CloseDrawdownPositions()
-  {
    ulong tickets[];
    int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
-
-   if(InpDrawdownCloseMode==DRAWDOWN_CLOSE_WAIT_CANDLES)
-      PruneDrawdownStreaks(_Symbol,InpMagicNumber);
-
+   ulong filled=0;
    for(int i=0;i<n;i++)
      {
-      if(!PositionSelectByTicket(tickets[i]))
-         continue;
-
-      double profit=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
-      long type=PositionGetInteger(POSITION_TYPE);
-      double entry=PositionGetDouble(POSITION_PRICE_OPEN);
-      double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-      double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-      // Positive when currently in a loss, by however many pips; zero or negative
-      // once at/above breakeven. Used by every mode except the original ANY_LOSS.
-      double lossPips=(type==POSITION_TYPE_BUY)
-                       ? PriceToPips(_Symbol,entry-bid)
-                       : PriceToPips(_Symbol,ask-entry);
-
-      bool shouldClose=false;
-      switch(InpDrawdownCloseMode)
+      if(FindPositionMgmt(tickets[i])>=0) continue;
+      if(!PositionSelectByTicket(tickets[i])) continue;
+      if(PositionGetString(POSITION_COMMENT)==g_cycleComment)
         {
-         case DRAWDOWN_CLOSE_ANY_LOSS:
-            shouldClose=(profit<0.0);
-            break;
-         case DRAWDOWN_CLOSE_MIN_THRESHOLD:
-            shouldClose=(lossPips>=InpDrawdownMinLossPips);
-            break;
-         case DRAWDOWN_CLOSE_PERCENT_OF_SL:
-            shouldClose=(lossPips>=InpStopLossPips*InpDrawdownPercentOfSL/100.0);
-            break;
-         case DRAWDOWN_CLOSE_WAIT_CANDLES:
-            if(lossPips>0.0)
-              {
-               int streak=IncrementDrawdownStreak(tickets[i]);
-               shouldClose=(streak>=InpDrawdownGraceCandles);
-              }
-            else
-               ResetDrawdownStreak(tickets[i]);
-            break;
+         filled=tickets[i];
+         break;
         }
+     }
 
-      if(shouldClose)
-        {
-         if(trade.PositionClose(tickets[i]))
-            Print("Closed drawdown position #",tickets[i]," profit=",DoubleToString(profit,2));
-         else
-            Print("Failed to close drawdown position #",tickets[i]," error=",GetLastError());
-        }
+   int direction=g_plannedDirection;
+   g_pendingEntryTicket=0;
+
+   if(filled!=0)
+     {
+      InitPositionMgmt(filled,direction);
+      g_state=STATE_IN_TRADE;
+      Print("Retracement order filled: #",filled);
+     }
+   else
+     {
+      Print("Pending retracement order disappeared without a matching fill, resuming scan.");
+      ResetCycle();
      }
   }
 
-// Idempotent breakeven check: recomputes the target SL from position state every call,
-// so it self-heals across EA restarts without needing separate "already armed" tracking.
-// InpLatencyBufferPips widens the lock beyond spread+buffer specifically to survive the
-// round trip between computing beSl here and the modify actually landing on the server -
-// by then price may have moved, so a too-tight lock risks an invalid-stops rejection or
-// executing at a worse level than intended. Self-heals on failure too: a rejected modify
-// just gets recomputed and retried from current price on the next tick.
-void ManageBreakeven()
-  {
-   ulong tickets[];
-   int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
-   if(n==0) return;
+//=== Trade management (IN_TRADE) ============================================
 
-   double spreadPips=CurrentSpreadPips(_Symbol);
-   double bePips=spreadPips+InpBreakevenBufferPips+InpLatencyBufferPips;
+// Every tick: 1R triggers a partial close plus SL->breakeven and TP->2R (precise
+// R-multiple levels can be touched and retreated from intrabar, so this can't wait
+// for a candle close). 2R hands off the fixed TP to the candle-close-driven trail.
+void ManageTradeLifecycle()
+  {
+   PrunePositionMgmt(_Symbol,InpMagicNumber);
+   if(ArraySize(g_positionMgmt)==0)
+      return;
+
+   ulong ticket=g_positionMgmt[0].ticket;
+   if(!PositionSelectByTicket(ticket))
+      return;
+
+   long type=PositionGetInteger(POSITION_TYPE);
+   double entry=g_positionMgmt[0].entryPrice;
+   double rPips=g_positionMgmt[0].rPips;
+   if(rPips<=0.0)
+      return;
+
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   double profitPips=(type==POSITION_TYPE_BUY)
+                      ? PriceToPips(_Symbol,bid-entry)
+                      : PriceToPips(_Symbol,entry-ask);
+
+   if(!g_positionMgmt[0].partialDone && profitPips>=rPips)
+     {
+      double volume=PositionGetDouble(POSITION_VOLUME);
+      double partialVol=NormalizeVolume(_Symbol,volume*InpPartialClosePercent/100.0);
+      double minVol=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+
+      if(partialVol>0.0 && partialVol<volume && (volume-partialVol)>=minVol)
+        {
+         if(trade.PositionClosePartial(ticket,partialVol))
+            Print("1R reached on #",ticket,": partial close ",DoubleToString(partialVol,2));
+         else
+            Print("1R: partial close failed on #",ticket," error=",GetLastError());
+        }
+      else
+         Print("1R reached on #",ticket,": skipping partial close (remainder would be below broker minimum)");
+
+      double bePips=CurrentSpreadPips(_Symbol)+InpBreakevenBufferPips+InpLatencyBufferPips;
+      double beSl=(type==POSITION_TYPE_BUY)
+                  ? NormalizeDouble(entry+PipsToPrice(_Symbol,bePips),digits)
+                  : NormalizeDouble(entry-PipsToPrice(_Symbol,bePips),digits);
+      double tp2R=(type==POSITION_TYPE_BUY)
+                  ? NormalizeDouble(entry+PipsToPrice(_Symbol,2.0*rPips),digits)
+                  : NormalizeDouble(entry-PipsToPrice(_Symbol,2.0*rPips),digits);
+
+      if(trade.PositionModify(ticket,beSl,tp2R))
+        {
+         g_positionMgmt[0].currentSl=beSl;
+         g_positionMgmt[0].partialDone=true;
+         Print("1R: SL->breakeven=",DoubleToString(beSl,digits)," TP->2R=",DoubleToString(tp2R,digits)," on #",ticket);
+        }
+      else
+         Print("1R: breakeven/TP2R modify failed on #",ticket," error=",GetLastError()," (retry next tick)");
+
+      return;
+     }
+
+   if(g_positionMgmt[0].partialDone && !g_positionMgmt[0].trailingActive && profitPips>=2.0*rPips)
+     {
+      if(trade.PositionModify(ticket,g_positionMgmt[0].currentSl,0.0))
+        {
+         g_positionMgmt[0].trailingActive=true;
+         Print("2R reached on #",ticket,": fixed TP cleared, trailing engaged.");
+        }
+      else
+         Print("2R: trailing handoff failed on #",ticket," error=",GetLastError()," (retry next tick)");
+     }
+  }
+
+// Once per new candle close, while trailing is active: ratchet the SL to
+// InpTrailStepPips behind price, only ever tightening. Matches the candle-close
+// cadence of this project's earlier trailing-stop implementation rather than
+// re-evaluating (and risking noise-driven whipsaw tightening) on every tick.
+void ManageTrailingStep()
+  {
+   if(ArraySize(g_positionMgmt)==0 || !g_positionMgmt[0].trailingActive)
+      return;
+
+   ulong ticket=g_positionMgmt[0].ticket;
+   if(!PositionSelectByTicket(ticket))
+      return;
+
+   long type=PositionGetInteger(POSITION_TYPE);
    double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
 
-   for(int i=0;i<n;i++)
+   double candidate=(type==POSITION_TYPE_BUY)
+                     ? NormalizeDouble(bid-PipsToPrice(_Symbol,InpTrailStepPips),digits)
+                     : NormalizeDouble(ask+PipsToPrice(_Symbol,InpTrailStepPips),digits);
+   bool improved=(type==POSITION_TYPE_BUY)
+                 ? (candidate>g_positionMgmt[0].currentSl)
+                 : (candidate<g_positionMgmt[0].currentSl);
+
+   if(improved)
      {
-      if(!PositionSelectByTicket(tickets[i]))
-         continue;
-
-      long type=PositionGetInteger(POSITION_TYPE);
-      double entry=PositionGetDouble(POSITION_PRICE_OPEN);
-      double currentSl=PositionGetDouble(POSITION_SL);
-      double tp=PositionGetDouble(POSITION_TP);
-
-      if(type==POSITION_TYPE_BUY)
-        {
-         double profitPips=PriceToPips(_Symbol,bid-entry);
-         double beSl=NormalizeDouble(entry+PipsToPrice(_Symbol,bePips),digits);
-         if(profitPips>=InpBreakevenTriggerPips && currentSl<beSl)
-           {
-            if(trade.PositionModify(tickets[i],beSl,tp))
-               Print("Breakeven applied to #",tickets[i]," new SL=",DoubleToString(beSl,digits));
-            else
-               Print("Breakeven modify failed for #",tickets[i]," error=",GetLastError(),
-                     " (will recompute and retry next tick)");
-           }
-        }
-      else if(type==POSITION_TYPE_SELL)
-        {
-         double profitPips=PriceToPips(_Symbol,entry-ask);
-         double beSl=NormalizeDouble(entry-PipsToPrice(_Symbol,bePips),digits);
-         if(profitPips>=InpBreakevenTriggerPips && (currentSl>beSl || currentSl==0.0))
-           {
-            if(trade.PositionModify(tickets[i],beSl,tp))
-               Print("Breakeven applied to #",tickets[i]," new SL=",DoubleToString(beSl,digits));
-            else
-               Print("Breakeven modify failed for #",tickets[i]," error=",GetLastError(),
-                     " (will recompute and retry next tick)");
-           }
-        }
+      if(trade.PositionModify(ticket,candidate,0.0))
+         g_positionMgmt[0].currentSl=candidate;
+      else
+         Print("Trailing step failed on #",ticket," error=",GetLastError());
      }
   }
+
+void CheckCycleCompletion()
+  {
+   if(ArraySize(g_positionMgmt)==0)
+      return;
+   if(!PositionSelectByTicket(g_positionMgmt[0].ticket))
+     {
+      Print("Cycle complete, resuming scan.");
+      ResetCycle();
+     }
+  }
+
+//=== Shared filters (reused across breakout confirmation) ===================
 
 bool SpreadOk()
   {
@@ -469,9 +750,8 @@ bool SpreadOk()
    return CurrentSpreadPips(_Symbol)<=InpMaxSpreadPips;
   }
 
-// Compares the just-closed candle's tick volume (the one whose high/low defines this
-// bar's breakout levels) against the average of the preceding InpVolumeLookbackBars
-// candles, so stops are only placed once activity picks up rather than every bar.
+// Compares the breakout candle's tick volume against the average of the preceding
+// InpVolumeLookbackBars candles.
 bool VolumeOk()
   {
    if(!InpUseVolumeFilter || InpVolumeLookbackBars<=0)
@@ -508,9 +788,12 @@ bool WithinSession()
    return hour>=InpTradingStartHour || hour<InpTradingEndHour;
   }
 
-// Closes every open position and cancels every pending order from this EA, once per
-// calendar day at InpDailyFlattenHour (server time) - e.g. midnight to avoid holding
-// overnight. Checked every tick so it fires promptly after the hour boundary.
+//=== Daily flatten ============================================================
+
+// Closes every open position and cancels the pending retracement order (if any)
+// once per calendar day at InpDailyFlattenHour (server time), then resumes
+// scanning from a clean state. Checked every tick so it fires promptly after
+// the hour boundary.
 void CheckDailyFlatten()
   {
    if(!InpUseDailyFlatten) return;
@@ -529,7 +812,7 @@ void CheckDailyFlatten()
 
 void FlattenAll()
   {
-   CancelStalePendingOrders();
+   CancelPendingEntry();
 
    ulong tickets[];
    int n=GetPositionTickets(_Symbol,InpMagicNumber,tickets);
@@ -540,4 +823,6 @@ void FlattenAll()
       else
          Print("Daily flatten: failed to close #",tickets[i]," error=",GetLastError());
      }
+
+   ResetCycle();
   }
